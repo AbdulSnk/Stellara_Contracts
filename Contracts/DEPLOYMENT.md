@@ -180,11 +180,84 @@ When ready for mainnet:
 4. Update all contract addresses in frontend code
 5. **Verify initializer protection** on all deployed contracts
 
+## Multisig Treasury Governance Initialization
+
+`MultisigTreasury.sol` is an EVM contract deployed with Hardhat. Its
+constructor performs **governance initialization** in a single call:
+
+```text
+MultisigTreasury(owners, required, dailyLimit, weeklyLimit, threshold,
+                 sensitiveRequired, timelockDelay)
+```
+
+| Parameter          | Meaning                                                        | Constraint                          |
+| :----------------- | :------------------------------------------------------------- | :---------------------------------- |
+| `owners`           | Multisig signers                                               | non-empty, unique, no zero address  |
+| `required`         | Confirmations for transfers above `threshold`                  | `1 ≤ required ≤ owners.length`      |
+| `dailyLimit`       | Daily spend cap (0 disables)                                   | any                                |
+| `weeklyLimit`      | Weekly spend cap (0 disables)                                  | any                                |
+| `threshold`        | Amount above which transfers need `required` confirmations     | any                                |
+| `sensitiveRequired`| Confirmations for sensitive actions                            | `required ≤ sensitiveRequired ≤ owners.length` |
+| `timelockDelay`    | Delay for risky operations                                     | `1 day ≤ delay ≤ 7 days`            |
+
+### One-shot deployment script
+
+```bash
+cd Contracts
+
+TREASURY_OWNERS="0xOwner1,0xOwner2,0xOwner3" \
+TREASURY_REQUIRED=2 \
+TREASURY_SENSITIVE_REQUIRED=3 \
+TREASURY_TIMELOCK_DAYS=2 \
+TREASURY_THRESHOLD_ETH=2 \
+TREASURY_DAILY_LIMIT_ETH=5 \
+TREASURY_WEEKLY_LIMIT_ETH=10 \
+./scripts/deploy/deploy.sh --network <network>
+```
+
+`deploy.sh` compiles, **gates deployment on the treasury test suite**,
+validates the governance parameters, deploys via
+`scripts/deploy/treasury-deploy.js`, and prints post-deploy verification
+commands. To deploy against a live network, add an RPC network entry to
+`hardhat.config.js` (e.g. Sepolia or an L2) and pass `--network <name>`.
+
+### Post-deployment verification checklist
+
+- [ ] `getOwners().length` matches the intended signer set
+- [ ] `required()` reflects the base multisig threshold
+- [ ] `sensitiveRequired()` ≥ `required()`
+- [ ] `timelockDelay()` is within 1–7 days
+- [ ] Fund the treasury and confirm `Deposit` events are emitted
+- [ ] Walk a full propose → confirm → execute cycle on a small transfer
+- [ ] Walk a full emergency freeze (unanimous, immediate) → unfreeze cycle
+- [ ] Record the treasury address in `README_TREASURY.md` and Frontend config
+
+### Governing after deployment
+
+All governance parameters (`updateLimits`, `updateTimelock`,
+`updateSensitiveRequired`) can only be changed through approved, timelocked
+multisig proposals targeting the treasury itself — see
+[docs/GOVERNANCE_GUIDE.md](./docs/GOVERNANCE_GUIDE.md).
+
 ## Upgrade Safety
 
 ### Storage Layout Gaps
 
-`MultisigTreasury` includes a `uint256[50] private __gap` at the end of its storage layout. This is the standard OpenZeppelin pattern for upgradeable contracts: it reserves 50 storage slots so that future state variables can be appended without shifting the positions of existing variables, which would corrupt proxy storage.
+`MultisigTreasury` includes a `uint256[47] private __gap` at the end of its storage layout. This is the standard OpenZeppelin pattern for upgradeable contracts: it reserves 47 storage slots so that future state variables can be appended without shifting the positions of existing variables, which would corrupt proxy storage.
+
+The gap was reduced from 50 to 47 slots when the hardened governance fields
+were appended **before** it:
+
+```text
+... weekSpent        (slot 12)
+sensitiveRequired    (slot 13)
+timelockDelay        (slot 14)
+_entered             (slot 15)  // reentrancy guard flag
+__gap[47]            (slots 16–62)
+```
+
+The `Transaction` struct also gained `minExecuteTime` (housed in the array's
+data region — no top-level slot shift).
 
 **Rules when upgrading:**
 - New state variables must be added **before** `__gap`, and `__gap` size must be reduced by the number of slots added.
@@ -258,6 +331,8 @@ Before deploying to any network:
 - [ ] Double-init is verified blocked on deployed contracts
 - [ ] Governance roles are correctly assigned
 - [ ] Multi-sig signers are configured
+- [ ] Treasury governance initialized: `sensitiveRequired ≥ required`, `1 ≤ timelockDelay ≤ 7 days`
+- [ ] Treasury test suite passes: `npx hardhat test test/MultisigTreasury.test.js`
 
 ## Further Resources
 
