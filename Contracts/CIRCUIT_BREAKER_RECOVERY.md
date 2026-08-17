@@ -54,3 +54,42 @@ For a safer recovery, admins can use a graduated approach:
 - `CONTRACT_FULLY_PAUSED`: Global pause active.
 - `FUNCTION_PAUSED`: Specific function call attempted while paused.
 - `UNAUTH`: Unauthorized call (only Admin can manage CB).
+
+---
+
+## MultisigTreasury Emergency Flow
+
+`MultisigTreasury.sol` (EVM) implements its own circuit breaker with stricter
+governance than a single admin:
+
+### Freeze (emergency pause)
+
+- **Unanimous approval required**: every owner must confirm the `emergencyFreeze()`
+  self-call proposal before it can execute (`insufficient confirmations for
+  emergency action` otherwise).
+- **Bypasses the timelock**: once the last owner confirms, execution is
+  immediate — a freeze must never wait days.
+
+### While frozen
+
+- Non-unfreeze proposals cannot be **confirmed** (`frozen`) or **executed**
+  (`frozen`).
+- Unfreeze proposals *can* still be confirmed, so recovery never deadlocks.
+- Deposits (`receive`) remain enabled.
+
+### Unfreeze (recovery)
+
+- Also **unanimous** and **immediate** (timelock bypass).
+- Submit `unfreezeInternal()` as a self-call:
+  `submitTransaction(address(this), 0, abi.encodeWithSelector(this.unfreezeInternal.selector))`.
+- Confirmations can be collected before or after the freeze activates.
+
+### Verification before unfreezing
+
+- [ ] Review `EmergencyFrozen` event and the freeze proposal's confirmers.
+- [ ] Confirm the root cause is remediated (see recovery steps above).
+- [ ] Coordinate all signers out-of-band; all must approve the unfreeze.
+- [ ] Execute the unfreeze only after unanimous confirmation.
+
+See [docs/GOVERNANCE_GUIDE.md](./docs/GOVERNANCE_GUIDE.md) for the full
+runbook and approval-tier table.
