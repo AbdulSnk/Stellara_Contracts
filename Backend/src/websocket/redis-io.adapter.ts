@@ -25,6 +25,34 @@ export class RedisIoAdapter extends IoAdapter {
   private pubClient: RedisClientType | undefined;
   private subClient: RedisClientType | undefined;
 
+  /**
+   * Dedicated client used for orphan-detection sweeps.  Kept separate
+   * from the pub/sub clients used by the Socket.IO adapter so that
+   * background scans never block message fanout.
+   */
+  private orphanScanClient: RedisClientType | undefined;
+
+  /** Timer for the periodic orphaned-connection sweep. */
+  private orphanSweepTimer: ReturnType<typeof setInterval> | undefined;
+
+  /**
+   * Interval (ms) between orphan sweeps.  Configurable via env so
+   * production can tune the frequency.
+   */
+  private readonly ORPHAN_SWEEP_INTERVAL_MS = parseInt(
+    process.env.ORPHAN_SWEEP_INTERVAL_MS || '60000',
+    10,
+  );
+
+  /**
+   * Socket heartbeat keys older than this many seconds are considered
+   * orphaned and purged.
+   */
+  private readonly SOCKET_HB_TTL_SECONDS = parseInt(
+    process.env.SOCKET_HEARTBEAT_TTL_SECONDS || '180',
+    10,
+  );
+
   constructor(app?: any) {
     super(app);
 
@@ -80,6 +108,10 @@ export class RedisIoAdapter extends IoAdapter {
     this.pubClient = createClient({ url: redisUrl, socket: socketOptions });
     this.subClient = this.pubClient.duplicate();
 
+    // Dedicated client for orphan scans — shares the same connection
+    // pool settings but runs independently.
+    this.orphanScanClient = createClient({ url: redisUrl, socket: socketOptions });
+
     this.pubClient.on('error', (err: Error) => {
       this.connectionState = 'error';
       this.logger.error(
@@ -91,6 +123,12 @@ export class RedisIoAdapter extends IoAdapter {
       this.connectionState = 'error';
       this.logger.error(
         `Redis Sub Client Error: ${maskRedisUrl(err.message)}`,
+      );
+    });
+
+    this.orphanScanClient.on('error', (err: Error) => {
+      this.logger.warn(
+        `Redis Orphan-Scan Client Error: ${maskRedisUrl(err.message)}`,
       );
     });
 
@@ -132,6 +170,7 @@ export class RedisIoAdapter extends IoAdapter {
       await Promise.all([
         this.pubClient.connect(),
         this.subClient.connect(),
+        this.orphanScanClient.connect(),
       ]);
       this.adapterConstructor = createAdapter(
         this.pubClient,
@@ -139,6 +178,9 @@ export class RedisIoAdapter extends IoAdapter {
       );
       this.connectionState = 'connected';
       this.logger.log('Redis adapter initialized successfully');
+
+      // Start periodic orphan sweep once connected.
+      this.startOrphanSweep();
     } catch (error) {
       this.connectionState = 'error';
       this.logger.warn(
@@ -164,10 +206,15 @@ export class RedisIoAdapter extends IoAdapter {
     server.on('connection', (socket) => {
       const namespace = socket.nsp?.name || '/';
       const correlationId = socket?.handshake?.auth?.correlationId || '';
+      const userId = socket?.handshake?.auth?.userId || '';
 
       if (this.metricsService) {
         this.metricsService.recordWebSocketConnection(namespace, correlationId);
       }
+
+      // Register a per-socket heartbeat so the orphan sweep can detect
+      // connections that survived a server crash or missed disconnect.
+      this.registerSocketHeartbeat(socket.id, userId).catch(() => {});
     });
 
     server.on('disconnecting', (_socket: Socket) => {
@@ -190,12 +237,123 @@ export class RedisIoAdapter extends IoAdapter {
     return server;
   }
 
+  // ── Socket heartbeat for orphan detection ────────────────────────────────
+
+  /**
+   * Write a `socket:{socketId}:lastSeen` key with a TTL.  The orphan
+   * sweep periodically scans these keys and purges any whose TTL has
+   * expired, catching connections that never sent a disconnect event.
+   */
+  private async registerSocketHeartbeat(
+    socketId: string,
+    userId: string,
+  ): Promise<void> {
+    if (!this.orphanScanClient) return;
+    const key = `socket:${socketId}:lastSeen`;
+    const now = Date.now().toString();
+    try {
+      await this.orphanScanClient.set(key, now, {
+        EX: this.SOCKET_HB_TTL_SECONDS,
+      });
+    } catch {
+      // Best-effort — don't let a heartbeat write failure block connection.
+    }
+  }
+
+  // ── Periodic orphan sweep ────────────────────────────────────────────────
+
+  /**
+   * Scan for `socket:*:lastSeen` keys whose TTL has expired or whose
+   * timestamp is older than the heartbeat threshold.  For each orphan,
+   * attempt to look up and tear down the associated user presence state.
+   *
+   * This catches two scenarios:
+   *   1. A connection that crashed without triggering a disconnect event.
+   *   2. A disconnect event that was lost during a Redis failover.
+   */
+  private startOrphanSweep(): void {
+    if (this.orphanSweepTimer) return;
+
+    this.orphanSweepTimer = setInterval(async () => {
+      try {
+        await this.sweepOrphanedConnections();
+      } catch (err) {
+        this.logger.warn(`Orphan sweep failed: ${(err as Error).message}`);
+      }
+    }, this.ORPHAN_SWEEP_INTERVAL_MS);
+
+    this.logger.debug(
+      `Orphan sweep started (interval=${this.ORPHAN_SWEEP_INTERVAL_MS}ms, ttl=${this.SOCKET_HB_TTL_SECONDS}s)`,
+    );
+  }
+
+  private async sweepOrphanedConnections(): Promise<void> {
+    if (!this.orphanScanClient) return;
+
+    // Cursor-based scan for socket heartbeat keys
+    let cursor = '0';
+    const now = Date.now();
+    const orphanThresholdMs = this.SOCKET_HB_TTL_SECONDS * 1000;
+    let purged = 0;
+
+    do {
+      const reply = await this.orphanScanClient.scan(cursor, {
+        MATCH: 'socket:*:lastSeen',
+        COUNT: 50,
+      });
+      cursor = reply.cursor;
+
+      for (const key of reply.keys) {
+        const lastSeen = await this.orphanScanClient.get(key);
+        if (!lastSeen) continue;
+
+        const idleMs = now - parseInt(lastSeen, 10);
+        if (idleMs > orphanThresholdMs) {
+          // The heartbeat key has outlived its expected TTL or the
+          // timestamp is stale — this is an orphaned connection.
+          await this.orphanScanClient.del(key).catch(() => {});
+
+          // Extract socketId from "socket:{id}:lastSeen"
+          const socketId = key.split(':')[1];
+          if (socketId && this.metricsService) {
+            const namespace = '/';
+            this.metricsService.recordWebSocketDisconnection(
+              namespace,
+              'orphan_purge',
+              socketId,
+            );
+          }
+
+          purged++;
+          this.logger.debug(
+            `Purged orphaned socket: key=${key} idle=${idleMs}ms`,
+          );
+        }
+      }
+    } while (cursor !== '0');
+
+    if (purged > 0) {
+      this.logger.log(`Orphan sweep: purged ${purged} stale socket heartbeat keys`);
+    }
+  }
+
   getConnectionState(): RedisConnectionState {
     return this.connectionState;
   }
 
   async close(): Promise<void> {
     this.logger.log('Closing Redis adapter connections...');
+
+    if (this.orphanSweepTimer) {
+      clearInterval(this.orphanSweepTimer);
+      this.orphanSweepTimer = undefined;
+    }
+
+    try {
+      await this.orphanScanClient?.quit().catch(() => {});
+    } catch {
+      // ignore
+    }
 
     try {
       await this.pubClient?.quit().catch(() => {});
@@ -211,6 +369,7 @@ export class RedisIoAdapter extends IoAdapter {
 
     this.pubClient = undefined;
     this.subClient = undefined;
+    this.orphanScanClient = undefined;
     this.adapterConstructor = undefined;
     this.connectionState = 'disconnected';
   }
