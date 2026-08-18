@@ -389,7 +389,7 @@ impl VerifiableCredentialsContract {
                 .unwrap_or_else(|| Map::new(&env));
             revocations.set(old_credential_id.clone(), RevocationEntry {
                 credential_id: old_credential_id.clone(),
-                revoker: caller.clone(),
+                revoker: old_credential.issuer.clone(),
                 revocation_date: env.ledger().timestamp(),
                 reason: symbol_short!("reissued"),
                 proof: Bytes::new(&env),
@@ -459,7 +459,7 @@ impl VerifiableCredentialsContract {
             (extended_topics::CREDENTIAL_ISSUED,),
             CredentialIssuedEvent {
                 credential_id: new_cred_id.clone(),
-                issuer_did: env.address().clone(),
+                issuer_did: issuer_did.clone(),
                 subject_did: new_subject_did,
                 credential_type: type_tag,
                 timestamp: env.ledger().timestamp(),
