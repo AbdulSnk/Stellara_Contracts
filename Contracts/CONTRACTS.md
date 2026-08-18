@@ -102,3 +102,95 @@ pub struct PoolConfig {
     pub apy_bps: u32,              // APY in basis points (100 = 1%)
 }
 ```
+
+## Verifiable Credentials Contract (Soroban)
+
+### Purpose
+W3C-style verifiable credential issuance, verification, revocation, and reissuance with governance-controlled lifecycle.
+
+### State Transitions
+
+All state transitions are enforced by the contract and emit dedicated events:
+
+```
+  ┌─────────┐      issue_credential()      ┌─────────┐
+  │         │ ──────────────────────────►  │  Valid   │
+  │  (new)  │                              │          │
+  └─────────┘                              └────┬─────┘
+                                                │
+                           ┌────────────────────┼────────────┐
+                           │                    │            │
+                    revoke_credential()   expires     reissue_credential()
+                           │                    │            │
+                     ┌─────▼──────┐       ┌─────▼─────┐  ┌──▼──────────────┐
+                     │  Revoked   │       │  Expired   │  │ New Valid       │
+                     │ (recorded) │       │ (emitted)  │  │ (old removed)   │
+                     └────────────┘       └───────────┘  └─────────────────┘
+                           │                    │            │
+                           └────────────────────┴────────────┘
+                                reissue_credential()
+```
+
+### Key Functions
+
+| Function | Access | Description |
+|---|---|---|
+| `issue_credential(...)` | Authenticated | Issue a new credential with type, claims, and optional expiration |
+| `verify_credential(id)` | Public | Returns `true` if credential is valid (not revoked, not expired, valid proof) |
+| `revoke_credential(...)` | Authenticated | Revoke with reason + proof; records in audit trail |
+| `reissue_credential(...)` | Authenticated | Atomic reissuance: old credential revoked + new issued in one tx |
+| `get_credential_status(id)` | Public | Returns `"valid"`, `"revoked"`, or `"expired"` as a Symbol |
+| `get_credential_details(id)` | Public | Full credential struct with all fields |
+| `get_credentials_by_subject(did)` | Public | All credential IDs for a subject |
+| `get_credentials_by_issuer(did)` | Public | All credential IDs issued by an issuer |
+| `get_revocation_status(id)` | Public | `Option<RevocationEntry>` with revoker, reason, date, proof |
+
+### Error Codes
+
+| Code | Name | When |
+|---|---|---|
+| 4001 | `InvalidCredential` | Expired expiration_date at issuance, or other validity failure |
+| 4002 | `UnauthorizedIssuer` | Caller not authorized |
+| 4003 | `CredentialNotFound` | Credential ID does not exist in storage |
+| 4004 | `AlreadyRevoked` | Attempting to revoke an already-revoked credential |
+| 4005 | `ExpiredCredential` | Attempting to revoke an expired credential (use reissue instead) |
+| 4006 | `InvalidProof` | Empty proof value |
+| 4008 | `GovernanceError` | Governance role check failed |
+| 4009 | `AlreadyInitialized` | Contract already initialized (double-init protection) |
+| 4010 | `StillActive` | Attempting to reissue a credential that is still active |
+| 4011 | `CredentialInvalid` | Credential is not valid for the requested operation |
+
+### Events
+
+| Topic | Payload |
+|---|---|
+| `cred_iss` | `CredentialIssuedEvent { credential_id, issuer_did, subject_did, credential_type, timestamp }` |
+| `cred_rev` | `CredentialRevokedEvent { credential_id, revoked_by, reason, timestamp }` |
+| `cred_reis` | `CredentialReissuedEvent { old_credential_id, new_credential_id, issuer, new_subject, old_subject, timestamp }` |
+| `cred_exp` | `CredentialExpiredEvent { credential_id, expired_at }` |
+
+### Revocation Record
+
+```rust
+pub struct RevocationEntry {
+    pub credential_id: Symbol,    // The revoked credential ID
+    pub revoker: Symbol,          // DID of the revoker
+    pub revocation_date: u64,     // Ledger timestamp of revocation
+    pub reason: Symbol,           // Human-readable reason
+    pub proof: Bytes,             // Cryptographic proof of revocation authority
+}
+```
+
+### Issuer Expectations
+
+1. Call `issue_credential()` with a valid proof and non-past expiration date.
+2. To revoke, call `revoke_credential()` with reason and proof — the credential must be active (not already revoked or expired).
+3. To reissue, call `reissue_credential()` — the old credential must be revoked or expired. Active credentials return `StillActive`.
+4. Use `get_credential_status()` to check state before operations.
+
+### Verifier Expectations
+
+1. Call `verify_credential(id)` — returns `true` only for valid, non-revoked, non-expired credentials.
+2. Use `get_credential_status(id)` for programmatic state checks (`"valid"`, `"revoked"`, `"expired"`).
+3. Use `get_revocation_status(id)` to retrieve full revocation audit data when needed.
+4. Always re-verify before trusting; credential state may change between checks.
