@@ -25,6 +25,8 @@ export interface RefreshResult {
   accessToken: string;
   newRefreshToken: string;
   familyId: string;
+  /** IDs of all tokens revoked as part of this operation (family abuse). */
+  revokedTokenIds?: string[];
 }
 
 @Injectable()
@@ -77,13 +79,8 @@ export class JwtAuthService {
 
     const saved = await this.refreshTokenRepository.save(refreshToken);
 
-    // Log refresh token creation
-    await this.auditService.logAction(
-      'REFRESH_TOKEN_CREATED',
-      userId,
-      saved.id,
-      { expiresAt: saved.expiresAt, familyId: resolvedFamilyId },
-    );
+    // Refresh token creation is routine — no audit event to avoid log noise.
+    // Sensitive operations (rotation, revocation, abuse) are audited.
 
     return {
       token: saved.token,
@@ -129,7 +126,17 @@ export class JwtAuthService {
     // Reuse detection: a token being presented *after* it was already rotated
     // is a classic replay signal. Revoke the entire family and fail hard.
     if (tokenRecord.revoked) {
-      await this.revokeFamily(tokenRecord, 'reuse_detected');
+      const revokedIds = await this.revokeFamily(tokenRecord, 'reuse_detected');
+      await this.auditService.logAction(
+        'TOKEN_FAMILY_ABUSE',
+        tokenRecord.userId,
+        tokenRecord.id,
+        {
+          familyId: tokenRecord.familyId,
+          reason: 'reuse_detected',
+          revokedTokenIds: revokedIds,
+        },
+      );
       throw new TokenInvalidError(
         'Refresh token reused after rotation. All sessions revoked.',
       );
@@ -146,38 +153,31 @@ export class JwtAuthService {
     }
 
     const familyId = tokenRecord.familyId ?? uuidv4();
+    const now = new Date();
 
-    // Rotate: atomically revoke the used token and issue a replacement in the
-    // same family so future reuse can be correlated and the chain broken.
-    await this.dataSource.transaction(async (manager) => {
-      const rtRepo = manager.getRepository(RefreshToken);
-      await rtRepo.update(
-        { id: tokenRecord.id },
-        {
-          revoked: true,
-          revokedAt: new Date(),
-          replacedAt: new Date(),
-          replacedByToken: undefined,
-        },
-      );
-      await rtRepo.update(
-        { id: tokenRecord.id },
-        { familyId, replacedAt: new Date() },
-      );
-    });
-
-    // Generate new tokens within the same family
+    // Generate replacement tokens first so we can atomically link the chain
+    // inside the same transaction that revokes the old token.
     const accessToken = this.generateAccessToken(tokenRecord.userId);
     const newRefreshTokenData = await this.generateRefreshToken(
       tokenRecord.userId,
       familyId,
     );
 
-    // Link the rotated-away token to its replacement for traceability.
-    await this.refreshTokenRepository.update(
-      { id: tokenRecord.id },
-      { replacedByToken: newRefreshTokenData.token },
-    );
+    // Rotate: atomically revoke the used token, record when it was replaced,
+    // and link it to the fresh successor — all in one transaction so a crash
+    // mid-rotation never leaves a half-linked chain.
+    await this.dataSource.transaction(async (manager) => {
+      const rtRepo = manager.getRepository(RefreshToken);
+      await rtRepo.update(
+        { id: tokenRecord.id },
+        {
+          revoked: true,
+          revokedAt: now,
+          replacedAt: now,
+          replacedByToken: newRefreshTokenData.token,
+        },
+      );
+    });
 
     await this.auditService.logAction(
       'ACCESS_TOKEN_REFRESHED',
@@ -197,26 +197,30 @@ export class JwtAuthService {
    * Revoke every still-valid token in a family. Used on logout, abuse
    * detection, and expiry so a single leaked token cannot be replayed into a
    * fresh session elsewhere.
+   *
+   * @returns IDs of all tokens that were revoked (for audit metadata).
    */
   private async revokeFamily(
     tokenRecord: RefreshToken,
     reason: string,
-  ): Promise<void> {
+  ): Promise<string[]> {
     const familyId = tokenRecord.familyId;
     if (!familyId) {
       await this.revokeRefreshToken(tokenRecord.id, reason);
-      return;
+      return [tokenRecord.id];
     }
 
     const siblings = await this.refreshTokenRepository.find({
       where: { familyId, revoked: false },
     });
 
+    const now = new Date();
     await this.refreshTokenRepository.update(
       { familyId, revoked: false },
-      { revoked: true, revokedAt: new Date() },
+      { revoked: true, revokedAt: now, revokedReason: reason },
     );
 
+    const revokedIds = siblings.map((s) => s.id);
     for (const sibling of siblings) {
       await this.auditService.logAction(
         'REFRESH_TOKEN_REVOKED',
@@ -225,6 +229,8 @@ export class JwtAuthService {
         { reason, familyId, scope: 'family' },
       );
     }
+
+    return revokedIds;
   }
 
   async revokeRefreshToken(tokenId: string, reason = 'logout'): Promise<void> {
@@ -240,6 +246,7 @@ export class JwtAuthService {
       {
         revoked: true,
         revokedAt: new Date(),
+        revokedReason: reason,
       },
     );
 
@@ -259,11 +266,13 @@ export class JwtAuthService {
       where: { userId, revoked: false },
     });
 
+    const now = new Date();
     await this.refreshTokenRepository.update(
       { userId, revoked: false },
       {
         revoked: true,
-        revokedAt: new Date(),
+        revokedAt: now,
+        revokedReason: reason,
       },
     );
 
