@@ -287,7 +287,9 @@ describe("SoulboundCredential", function () {
 
   describe("Expiration edge cases", function () {
     it("should handle credential expiring during validity check", async () => {
-      const expTime = Math.floor(Date.now() / 1000) + 5;
+      // Get current blockchain timestamp to avoid JS/blockchain time drift
+      const latestBlock = await ethers.provider.getBlock("latest");
+      const expTime = latestBlock.timestamp + 5;
       await sbt.issue(alice.address, 50, expTime);
       expect(await sbt.valid(50)).to.equal(true);
       // Advance time past expiration using Hardhat network manipulation
@@ -298,7 +300,8 @@ describe("SoulboundCredential", function () {
     });
 
     it("should not allow renew on credential that expires during operation", async () => {
-      const expTime = Math.floor(Date.now() / 1000) + 5;
+      const latestBlock = await ethers.provider.getBlock("latest");
+      const expTime = latestBlock.timestamp + 5;
       await sbt.issue(alice.address, 60, expTime);
       await ethers.provider.send("evm_increaseTime", [10]);
       await ethers.provider.send("evm_mine", []);
