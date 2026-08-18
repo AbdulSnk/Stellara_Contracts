@@ -20,6 +20,7 @@ import { AiModule } from './ai/ai.module';
 
 import { RolesGuard } from './guards/roles.guard';
 import { ConfigValidationService } from './config/config-validation.service';
+import { StartupValidationService } from './config/startup-validation.service';
 import { SecretsMaskingService } from './config/secrets-masking.service';
 import { SecretsRotationService } from './config/secrets-rotation.service';
 
@@ -101,6 +102,7 @@ VoiceJob,
   providers: [
     AppService,
     ConfigValidationService,
+    StartupValidationService,
     SecretsMaskingService,
     SecretsRotationService,
 
