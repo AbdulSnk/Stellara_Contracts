@@ -159,12 +159,14 @@ export class AuthController {
       message,
     );
 
+    const correlationId = uuidv4();
+
     if (!isValid) {
       await this.auditService.logAction(
         'WALLET_LOGIN_FAILED',
         'unknown',
         undefined,
-        { reason: 'invalid_signature', wallet: dto.publicKey },
+        { reason: 'invalid_signature', wallet: dto.publicKey, correlationId },
       );
       throw new InvalidSignatureError('Invalid wallet signature');
     }
@@ -179,7 +181,7 @@ export class AuthController {
         'WALLET_LOGIN_FAILED',
         'unknown',
         undefined,
-        { reason: 'invalid_nonce', wallet: dto.publicKey },
+        { reason: 'invalid_nonce', wallet: dto.publicKey, correlationId },
       );
       throw error;
     }
@@ -198,7 +200,7 @@ export class AuthController {
           'WALLET_LOGIN_FAILED',
           'unknown',
           undefined,
-          { reason: 'user_creation_failed', wallet: dto.publicKey },
+          { reason: 'user_creation_failed', wallet: dto.publicKey, correlationId },
         );
         throw error;
       }
@@ -282,11 +284,19 @@ export class AuthController {
       dto.refreshToken,
     );
 
-    return {
+    const response: Record<string, unknown> = {
       accessToken: tokens.accessToken,
       refreshToken: tokens.newRefreshToken,
       familyId: tokens.familyId,
     };
+
+    // When a family abuse event was detected, surface the revoked IDs so
+    // clients know the session chain is broken.
+    if (tokens.revokedTokenIds?.length) {
+      response.revokedTokenIds = tokens.revokedTokenIds;
+    }
+
+    return response;
   }
 
   @Post('logout')
@@ -401,12 +411,14 @@ export class AuthController {
       message,
     );
 
+    const correlationId = uuidv4();
+
     if (!isValid) {
       await this.auditService.logAction(
         'WALLET_BIND_FAILED',
         req.user.id,
         req.user.id,
-        { reason: 'invalid_signature', wallet: dto.publicKey },
+        { reason: 'invalid_signature', wallet: dto.publicKey, correlationId },
       );
       throw new InvalidSignatureError('Invalid wallet signature');
     }
@@ -419,7 +431,7 @@ export class AuthController {
         'WALLET_BIND_FAILED',
         req.user.id,
         req.user.id,
-        { reason: 'invalid_nonce', wallet: dto.publicKey },
+        { reason: 'invalid_nonce', wallet: dto.publicKey, correlationId },
       );
       throw error;
     }
@@ -438,7 +450,7 @@ export class AuthController {
         'WALLET_BIND_FAILED',
         req.user.id,
         req.user.id,
-        { reason: 'bind_failed', wallet: dto.publicKey },
+        { reason: 'bind_failed', wallet: dto.publicKey, correlationId },
       );
       throw error;
     }

@@ -22,6 +22,9 @@ export class LoginNonce {
   @Column({ default: false })
   used: boolean;
 
+  @Column({ type: 'timestamp', nullable: true })
+  consumedAt?: Date | null;
+
   @CreateDateColumn({ type: 'timestamp' })
   createdAt: Date;
 }

@@ -7,6 +7,7 @@ import {
   Logger,
 } from '@nestjs/common';
 import { Request, Response } from 'express';
+import { randomUUID as uuidv4 } from 'crypto';
 import { ApiError, ApiErrorBody, ApiErrorCode } from '../exceptions/api-error.exception';
 
 /**
@@ -56,6 +57,7 @@ export class HttpExceptionFilter implements ExceptionFilter {
 
   private buildErrorBody(exception: unknown, path: string): ApiErrorBody {
     const timestamp = new Date().toISOString();
+    const correlationId = uuidv4();
 
     // ── 1. Our own typed ApiError ────────────────────────────────────────────
     if (exception instanceof ApiError) {
@@ -65,6 +67,7 @@ export class HttpExceptionFilter implements ExceptionFilter {
         errorCode: exception.errorCode,
         message: exception.message,
         details: exception.details ?? null,
+        correlationId: exception.correlationId ?? correlationId,
         timestamp,
         path,
       };
