@@ -564,6 +564,26 @@ pub struct CredentialRevokedEvent {
     pub timestamp: u64,
 }
 
+/// Emitted when a credential is reissued (old burned, new minted)
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct CredentialReissuedEvent {
+    pub old_credential_id: Symbol,
+    pub new_credential_id: Symbol,
+    pub issuer: Symbol,
+    pub new_subject: Symbol,
+    pub old_subject: Symbol,
+    pub timestamp: u64,
+}
+
+/// Emitted when a credential expires
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct CredentialExpiredEvent {
+    pub credential_id: Symbol,
+    pub expired_at: u64,
+}
+
 // =============================================================================
 // Synthetic Assets Events
 // =============================================================================
@@ -747,6 +767,8 @@ pub mod extended_topics {
     // Verifiable credentials
     pub const CREDENTIAL_ISSUED: Symbol       = symbol_short!("cred_iss");
     pub const CREDENTIAL_REVOKED: Symbol      = symbol_short!("cred_rev");
+    pub const CREDENTIAL_REISSUED: Symbol     = symbol_short!("cred_reis");
+    pub const CREDENTIAL_EXPIRED: Symbol      = symbol_short!("cred_exp");
 
     // Synthetic assets
     pub const ASSET_REGISTERED: Symbol        = symbol_short!("asset_reg");
