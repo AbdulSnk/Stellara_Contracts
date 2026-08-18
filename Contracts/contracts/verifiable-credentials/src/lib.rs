@@ -5,7 +5,10 @@ use soroban_sdk::{
     contracterror,
 };
 use shared::governance::{GovernanceManager, GovernanceRole};
-use shared::events::{extended_topics, CredentialIssuedEvent, CredentialRevokedEvent};
+use shared::events::{
+    extended_topics, CredentialIssuedEvent, CredentialRevokedEvent,
+    CredentialReissuedEvent, CredentialExpiredEvent,
+};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Storage keys
@@ -104,6 +107,10 @@ pub enum VCError {
     GovernanceError     = 4008,
     /// Returned when `initialize()` is called more than once.
     AlreadyInitialized  = 4009,
+    /// Credential is still active — cannot reissue without revoking first.
+    StillActive         = 4010,
+    /// Attempted operation requires a valid (non-expired, non-revoked) credential.
+    CredentialInvalid   = 4011,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -239,6 +246,13 @@ impl VerifiableCredentialsContract {
         }
         if let Some(exp) = credential.expiration_date {
             if env.ledger().timestamp() > exp {
+                env.events().publish(
+                    (extended_topics::CREDENTIAL_EXPIRED,),
+                    CredentialExpiredEvent {
+                        credential_id,
+                        expired_at: exp,
+                    },
+                );
                 return Ok(false);
             }
         }
@@ -247,6 +261,21 @@ impl VerifiableCredentialsContract {
         }
 
         Ok(true)
+    }
+
+    /// Returns the credential status as a Symbol: "valid", "revoked", or "expired".
+    pub fn get_credential_status(env: Env, credential_id: Symbol) -> Result<Symbol, VCError> {
+        let credential = Self::load_cred(&env, &credential_id)?;
+
+        if Self::is_revoked(&env, &credential_id) {
+            return Ok(symbol_short!("revoked"));
+        }
+        if let Some(exp) = credential.expiration_date {
+            if env.ledger().timestamp() > exp {
+                return Ok(symbol_short!("expired"));
+            }
+        }
+        Ok(symbol_short!("valid"))
     }
 
     // ── Revocation ────────────────────────────────────────────────────────
@@ -265,6 +294,11 @@ impl VerifiableCredentialsContract {
 
         if Self::is_revoked(&env, &credential_id) {
             return Err(VCError::AlreadyRevoked);
+        }
+
+        // Reject revocation of expired credentials — use reissue instead
+        if Self::is_expired(&env, &credential) {
+            return Err(VCError::ExpiredCredential);
         }
 
         // Record revocation
@@ -301,6 +335,138 @@ impl VerifiableCredentialsContract {
         );
 
         Ok(())
+    }
+
+    // ── Reissuance ────────────────────────────────────────────────────────
+
+    /// Reissue a credential: atomically revokes (or removes) the old credential
+    /// and issues a fresh one. The old credential's revocation record is preserved
+    /// for audit history. The new credential gets a fresh issuance date and
+    /// independent expiration.
+    ///
+    /// State transitions enforced:
+    /// - Only "revoked" or "expired" credentials can be reissued
+    /// - Active credentials must be revoked first (returns StillActive)
+    pub fn reissue_credential(
+        env: Env,
+        caller: Address,
+        old_credential_id: Symbol,
+        issuer_did: Symbol,
+        new_subject_did: Symbol,
+        credential_type: CredentialType,
+        claims: Map<Symbol, Symbol>,
+        expiration_date: Option<u64>,
+        proof: Proof,
+    ) -> Result<Symbol, VCError> {
+        caller.require_auth();
+
+        let old_credential = Self::load_cred(&env, &old_credential_id)?;
+
+        // State transition enforcement: old credential must be revoked or expired
+        let is_revoked = Self::is_revoked(&env, &old_credential_id);
+        let is_expired = Self::is_expired(&env, &old_credential);
+
+        if !is_revoked && !is_expired {
+            return Err(VCError::StillActive);
+        }
+
+        if proof.proof_value.is_empty() {
+            return Err(VCError::InvalidProof);
+        }
+        if let Some(exp) = expiration_date {
+            if exp <= env.ledger().timestamp() {
+                return Err(VCError::InvalidCredential);
+            }
+        }
+
+        // Capture old subject for the reissue event
+        let old_subject = old_credential.credential_subject.id.clone();
+
+        // If not already revoked, add a revocation record for audit trail
+        if !is_revoked {
+            let mut revocations: Map<Symbol, RevocationEntry> = env
+                .storage().persistent().get(&keys::REVOCATN)
+                .unwrap_or_else(|| Map::new(&env));
+            revocations.set(old_credential_id.clone(), RevocationEntry {
+                credential_id: old_credential_id.clone(),
+                revoker: old_credential.issuer.clone(),
+                revocation_date: env.ledger().timestamp(),
+                reason: symbol_short!("reissued"),
+                proof: Bytes::new(&env),
+            });
+            env.storage().persistent().set(&keys::REVOCATN, &revocations);
+        }
+
+        // Issue new credential
+        let count: u64 = env.storage().persistent().get(&keys::VC_CNT).unwrap_or(0);
+        let new_cred_id = Self::count_symbol(&env, count, "vc");
+
+        let mut type_vec = Vec::new(&env);
+        type_vec.push_back(symbol_short!("vc"));
+        let type_tag = match credential_type {
+            CredentialType::KYCVerified            => symbol_short!("kyc_vc"),
+            CredentialType::AccreditedInvestor     => symbol_short!("acc_vc"),
+            CredentialType::EducationalAchievement => symbol_short!("edu_vc"),
+            CredentialType::ProfessionalLicense    => symbol_short!("pro_vc"),
+            CredentialType::Custom                 => symbol_short!("cust_vc"),
+        };
+        type_vec.push_back(type_tag.clone());
+
+        let status_id = Self::count_symbol(&env, count, "sts");
+        let new_credential = VerifiableCredential {
+            id: new_cred_id.clone(),
+            context: symbol_short!("w3c_ctx"),
+            type_: type_vec,
+            issuer: issuer_did.clone(),
+            issuance_date: env.ledger().timestamp(),
+            expiration_date,
+            credential_subject: CredentialSubject {
+                id: new_subject_did.clone(),
+                claims,
+            },
+            proof,
+            credential_status: CredentialStatus {
+                id: status_id,
+                type_: symbol_short!("csl2021"),
+                status: symbol_short!("valid"),
+                revocation_reason: None,
+            },
+            created_at: env.ledger().timestamp(),
+        };
+
+        let mut creds: Map<Symbol, VerifiableCredential> = env
+            .storage().persistent().get(&keys::CREDS)
+            .unwrap_or_else(|| Map::new(&env));
+        creds.set(new_cred_id.clone(), new_credential);
+        env.storage().persistent().set(&keys::CREDS, &creds);
+        env.storage().persistent().set(&keys::VC_CNT, &(count + 1));
+
+        // Emit reissue event
+        env.events().publish(
+            (extended_topics::CREDENTIAL_REISSUED,),
+            CredentialReissuedEvent {
+                old_credential_id,
+                new_credential_id: new_cred_id.clone(),
+                issuer: issuer_did.clone(),
+                new_subject: new_subject_did.clone(),
+                old_subject,
+                timestamp: env.ledger().timestamp(),
+            },
+        );
+
+        // Also emit the standard issued event for new-subscription indexers
+        env.events().publish(
+            (extended_topics::CREDENTIAL_ISSUED,),
+            CredentialIssuedEvent {
+                credential_id: new_cred_id.clone(),
+                issuer_did,
+                subject_did: new_subject_did,
+                credential_type: type_tag,
+                timestamp: env.ledger().timestamp(),
+            },
+        );
+
+        Ok(new_cred_id)
     }
 
     // ── Queries ───────────────────────────────────────────────────────────
@@ -364,6 +530,14 @@ impl VerifiableCredentialsContract {
             .storage().persistent().get(&keys::REVOCATN)
             .unwrap_or_else(|| Map::new(env));
         revocations.contains_key(credential_id.clone())
+    }
+
+    fn is_expired(env: &Env, credential: &VerifiableCredential) -> bool {
+        if let Some(exp) = credential.expiration_date {
+            env.ledger().timestamp() > exp
+        } else {
+            false
+        }
     }
 
     fn load_cred(env: &Env, credential_id: &Symbol) -> Result<VerifiableCredential, VCError> {

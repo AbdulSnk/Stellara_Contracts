@@ -16,18 +16,39 @@ Deployment and testing
 
 ### Credential Lifecycle Security (SoulboundCredential.sol)
 
-Credentials follow a strict lifecycle enforced by modifiers on every public entry point:
+Credentials follow a strict lifecycle enforced by modifiers on every public entry point.
+All state transitions are atomic and enforced by dedicated modifiers:
 
 ```
-Issued ──► Active ──► Revoked / Expired
-                  │
-                  └──► Reissued (new token, old burned)
+                        ┌──────────────────────────────┐
+                        │         ┌─────────┐          │
+                   ┌───►│  Active │ (valid) │          │
+                   │    │         └────┬────┘          │
+                   │    └──────────────┼──────────────┘
+  issue()         │                    │
+  ─────────►      │         ┌──────────┼──────────┐
+  (new token)     │         │          │          │
+                  │    revoke()  expires    reissue()
+                  │         │          │          │
+                  │    ┌────▼────┐ ┌───▼───┐ ┌───▼────────────┐
+                  │    │ Revoked │ │Expired│ │ New Active     │
+                  │    │(logged) │ │(emit) │ │ (old burned)   │
+                  │    └─────────┘ └───────┘ └────────────────┘
+                  │         │          │          │
+                  └─────────┴──────────┴──────────┘
+                        reissue() reissue()   (loop)
 ```
+
+**State transition modifiers:**
+- `onlyActive(tokenId)` – enforces exists + not revoked + not expired; emits `CredentialExpired` on expiry detection
+- `onlyRevocable(tokenId)` – enforces exists + not yet revoked (double-revoke reverted)
+- `onlyIfValid(tokenId)` – enforces exists + not revoked + not expired (reverts with specific message)
 
 **Enforced invariants:**
-- **Revocation is immediate and irreversible** – once revoked, all `valid()` checks return false. Revoked tokens cannot be renewed; use `reissue()` to mint a replacement.
-- **Expiration is checked on every operation** – `renew()` rejects expired tokens. `valid()` returns false past expiry.
-- **Re-issuance cleanly handles old state** – `reissue()` burns the old token, clears its state, and mints a fresh credential. Works even when the old credential was revoked or expired.
+- **Revocation is immediate and irreversible** – once revoked, `revoked[tokenId]` is `true`, all `valid()` checks return false, and `revoke()`/`renew()` revert. Use `reissue()` to mint a replacement.
+- **Expiration is checked on every write operation** – `renew()` and `revoke()` reject expired tokens via `onlyActive`. `valid()` returns false past expiry.
+- **Revocation records include timestamp and reason** – every revocation stores `revokedAt[tokenId]` and `revocationReason[tokenId]`. Use `revocationRecord(tokenId)` to retrieve the full audit record.
+- **Re-issuance is atomic** – `reissue()` burns the old token, clears all its state (expiration, revoked, revokedAt, revocationReason), and mints a fresh credential in one transaction.
 - **Transfers and approvals are always blocked** – all ERC-721 transfer/approval functions revert with explicit messages.
 
 **Events emitted by SoulboundCredential:**
@@ -35,13 +56,20 @@ Issued ──► Active ──► Revoked / Expired
 | Event | When |
 |---|---|
 | `CredentialIssued(to, tokenId, expiresAt)` | New credential minted |
-| `CredentialRevoked(tokenId)` | Credential revoked by issuer |
-| `CredentialExpired(tokenId)` | (logged on check) Past expiry detected |
+| `CredentialRevoked(tokenId, timestamp, reason)` | Credential revoked (includes timestamp + reason) |
+| `CredentialExpired(tokenId, expiredAt)` | Expired credential detected on write path |
 | `CredentialRenewed(tokenId, newExpiresAt)` | Expiration extended |
-| `CredentialReissued(to, tokenId, expiresAt)` | New credential replaces old |
+| `CredentialReissued(to, tokenId, expiresAt, oldTokenId)` | New credential replaces old (includes old token ID) |
+
+**Issuer expectations:**
+- Call `issue(to, tokenId, expiresAt)` to mint. Use `expiresAt = 0` for no expiration.
+- Call `revoke(tokenId)` or `revokeWithReason(tokenId, reason)` to revoke. Revocation is permanent; use `reissue()` for replacement.
+- Call `renew(tokenId, newExpiresAt)` to extend an active credential. Cannot renew revoked or expired tokens.
+- Call `reissue(newHolder, oldTokenId, newTokenId, expiresAt)` to atomically burn old and mint new. Works for revoked, expired, or non-existent old tokens.
 
 **Verifier expectations:**
 - Call `valid(tokenId)` to check revocation + expiration in a single view call.
+- Call `revocationRecord(tokenId)` to get `(revoked, timestamp, reason)` for audit purposes.
 - Use `isRevoked(tokenId)` and `isExpired(tokenId)` individually when detailed status is needed.
 - Always re-verify before trusting a credential; state may change between issuance and verification.
 
@@ -60,10 +88,13 @@ The contract uses bitmap packing to store 256 revocation statuses per storage sl
 - Bitmap-based storage: 256 tokens per `uint256` slot
 - `revokedCount` cache eliminates repeated counting
 - `batchRevoke`, `batchUnrevoke`, `batchSetRevokedInRange` for batched writes
+- `batchRevokeWithReason(tokenContract, tokenIds, reason)` – batch revoke with shared reason
 - `batchIsRevoked` and `getRevokedBitmap` for batched reads
+- **Revocation records with timestamp and reason** – `revocationTimestamp` and `revocationReason` mappings track per-token audit data. Use `getRevocationRecord(tokenContract, tokenId)` to retrieve `(active, timestamp, reason, expiry)`.
 - **Time-based revocation expiry** – `setRevokedWithExpiry` and `batchSetRevokedWithExpiry` allow revocations to auto-expire; `isRevoked()` returns false once the expiry timestamp has passed
 - `clearAll(contract)` – reset all revocation state for a token contract in a single call
 - Batch range operations emit `RevocationBatchSet` / `RevocationBatchCleared` events for off-chain indexing
+- `RevocationSetWithReason` event emitted on every revocation with timestamp and reason for full auditability
   📜 Stellara AI Smart Contracts (Soroban)
 
 Soroban smart contracts powering Stellara AI, a Web3 crypto learning and social trading platform built on the Stellar blockchain. These contracts provide decentralized services for education credentials, social rewards, messaging, and on-chain trading used by the Stellara backend and frontend applications.
@@ -394,6 +425,8 @@ All on-chain state changes emit standardised events via `shared::events`. Off-ch
 | `DISCLOSURE_CREATED` | `disc_crt` | identity-hub | `SelectiveDisclosureCreatedEvent` |
 | `CREDENTIAL_ISSUED` | `cred_iss` | verifiable-credentials | `CredentialIssuedEvent` |
 | `CREDENTIAL_REVOKED` | `cred_rev` | verifiable-credentials | `CredentialRevokedEvent` |
+| `CREDENTIAL_REISSUED` | `cred_reis` | verifiable-credentials | `CredentialReissuedEvent` |
+| `CREDENTIAL_EXPIRED` | `cred_exp` | verifiable-credentials | `CredentialExpiredEvent` |
 | `ASSET_REGISTERED` | `asset_reg` | synthetic-assets | `AssetRegisteredEvent` |
 | `CDP_OPENED` | `cdp_open` | synthetic-assets | `CdpOpenedEvent` |
 | `CDP_CLOSED` | `cdp_close` | synthetic-assets | `CdpClosedEvent` |

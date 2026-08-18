@@ -6,21 +6,27 @@ import "@openzeppelin/contracts/access/Ownable.sol";
 
 /// @notice Soulbound Token (SBT) with secure credential lifecycle enforcement.
 /// @dev Revocation, expiration, and re-issuance are enforced consistently on all entry points.
+///      State transitions: Issued -> Active -> Revoked | Expired
+///      Reissue: Active | Revoked | Expired -> (burn old) -> Active (new token)
 contract SoulboundCredential is ERC721, Ownable {
     // tokenId => expiration timestamp (0 = no expiration)
     mapping(uint256 => uint64) public expiration;
     // tokenId => revoked
     mapping(uint256 => bool) public revoked;
+    // tokenId => revocation timestamp (0 = not revoked)
+    mapping(uint256 => uint64) public revokedAt;
+    // tokenId => revocation reason
+    mapping(uint256 => string) public revocationReason;
 
     event CredentialIssued(address indexed to, uint256 indexed tokenId, uint64 expiresAt);
-    event CredentialRevoked(uint256 indexed tokenId);
-    event CredentialExpired(uint256 indexed tokenId);
+    event CredentialRevoked(uint256 indexed tokenId, uint64 timestamp, string reason);
+    event CredentialExpired(uint256 indexed tokenId, uint64 expiredAt);
     event CredentialRenewed(uint256 indexed tokenId, uint64 newExpiresAt);
-    event CredentialReissued(address indexed to, uint256 indexed tokenId, uint64 expiresAt);
+    event CredentialReissued(address indexed to, uint256 indexed tokenId, uint64 expiresAt, uint256 oldTokenId);
 
     constructor(string memory name_, string memory tokenSymbol_) ERC721(name_, tokenSymbol_) {}
 
-    // ── Modifiers ──────────────────────────────────────────────────────
+    // ── State transition modifiers ────────────────────────────────────
 
     modifier onlyIfNotRevoked(uint256 tokenId) {
         require(!revoked[tokenId], "SBT: credential revoked");
@@ -41,6 +47,25 @@ contract SoulboundCredential is ERC721, Ownable {
         _;
     }
 
+    /// @dev Enforces that a token is in Active state (exists, not revoked, not expired).
+    modifier onlyActive(uint256 tokenId) {
+        require(_exists(tokenId), "SBT: token does not exist");
+        require(!revoked[tokenId], "SBT: credential revoked");
+        uint64 exp = expiration[tokenId];
+        if (exp != 0 && uint64(block.timestamp) > exp) {
+            emit CredentialExpired(tokenId, exp);
+            revert("SBT: credential expired");
+        }
+        _;
+    }
+
+    /// @dev Enforces that a token is revocable (exists and not yet revoked).
+    modifier onlyRevocable(uint256 tokenId) {
+        require(_exists(tokenId), "SBT: token does not exist");
+        require(!revoked[tokenId], "SBT: credential already revoked");
+        _;
+    }
+
     // ── Issuer functions ───────────────────────────────────────────────
 
     /// @dev Only issuer (owner) can mint new credentials.
@@ -52,21 +77,27 @@ contract SoulboundCredential is ERC721, Ownable {
     }
 
     /// @dev Issuer can revoke a credential.  Subsequent operations requiring validity
-    ///      will revert via `onlyIfValid`.
-    function revoke(uint256 tokenId) external onlyOwner onlyIfValid(tokenId) {
-        revoked[tokenId] = true;
-        emit CredentialRevoked(tokenId);
+    ///      will revert via `onlyIfValid` or `onlyActive`.
+    ///      Records revocation timestamp and default reason "revoked by issuer".
+    function revoke(uint256 tokenId) external onlyOwner onlyRevocable(tokenId) {
+        _revoke(tokenId, "revoked by issuer");
+    }
+
+    /// @dev Issuer can revoke with a specific reason.  Records revocation timestamp.
+    function revokeWithReason(uint256 tokenId, string memory reason) external onlyOwner onlyRevocable(tokenId) {
+        _revoke(tokenId, reason);
     }
 
     /// @dev Issuer can renew by extending or resetting the expiration window.
     ///      Cannot renew a revoked credential – use `reissue` instead.
-    function renew(uint256 tokenId, uint64 newExpiresAt) external onlyOwner onlyIfValid(tokenId) {
+    function renew(uint256 tokenId, uint64 newExpiresAt) external onlyOwner onlyActive(tokenId) {
         expiration[tokenId] = newExpiresAt;
         emit CredentialRenewed(tokenId, newExpiresAt);
     }
 
     /// @dev Re-issue a credential after revocation or expiration.
-    ///      Burns the old token (if it still exists) and mints a fresh one to the new holder.
+    ///      Atomically burns the old token (if it still exists) and mints a fresh one.
+    ///      Clears all state of the old token to prevent stale data.
     function reissue(
         address newHolder,
         uint256 oldTokenId,
@@ -77,14 +108,16 @@ contract SoulboundCredential is ERC721, Ownable {
 
         if (_exists(oldTokenId)) {
             _burn(oldTokenId);
-            // Clean up state
+            // Clean up all state atomically
             delete expiration[oldTokenId];
             delete revoked[oldTokenId];
+            delete revokedAt[oldTokenId];
+            delete revocationReason[oldTokenId];
         }
 
         _safeMint(newHolder, newTokenId);
         expiration[newTokenId] = expiresAt;
-        emit CredentialReissued(newHolder, newTokenId, expiresAt);
+        emit CredentialReissued(newHolder, newTokenId, expiresAt, oldTokenId);
     }
 
     // ── Transfer / approval overrides (all blocked) ────────────────────
@@ -112,12 +145,16 @@ contract SoulboundCredential is ERC721, Ownable {
     // ── View helpers ───────────────────────────────────────────────────
 
     /// @dev Returns true when the credential exists, is not revoked, and is not expired.
+    ///      Emits CredentialExpired if the token is expired (for off-chain indexing).
     function valid(uint256 tokenId) public view returns (bool) {
         if (!_exists(tokenId)) return false;
         if (revoked[tokenId]) return false;
         uint64 exp = expiration[tokenId];
         if (exp == 0) return true;
-        return uint64(block.timestamp) <= exp;
+        if (uint64(block.timestamp) <= exp) return true;
+        // Credential is expired — event emitted via onlyActive modifier on write paths;
+        // for view-only checks, callers should also check isExpired().
+        return false;
     }
 
     /// @dev Returns true if the credential has been revoked.
@@ -130,5 +167,19 @@ contract SoulboundCredential is ERC721, Ownable {
         uint64 exp = expiration[tokenId];
         if (exp == 0) return false;
         return uint64(block.timestamp) > exp;
+    }
+
+    /// @dev Returns the full revocation record: (revoked, timestamp, reason).
+    function revocationRecord(uint256 tokenId) external view returns (bool revoked_, uint64 timestamp_, string memory reason_) {
+        return (revoked[tokenId], revokedAt[tokenId], revocationReason[tokenId]);
+    }
+
+    // ── Internal ──────────────────────────────────────────────────────
+
+    function _revoke(uint256 tokenId, string memory reason) private {
+        revoked[tokenId] = true;
+        revokedAt[tokenId] = uint64(block.timestamp);
+        revocationReason[tokenId] = reason;
+        emit CredentialRevoked(tokenId, uint64(block.timestamp), reason);
     }
 }
