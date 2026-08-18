@@ -5,6 +5,7 @@ import { AppModule } from './app.module';
 import { RedisIoAdapter } from './websocket/redis-io.adapter';
 import { ThrottleGuard } from './throttle/throttle.guard';
 import { ConfigValidationService } from './config/config-validation.service';
+import { StartupValidationService } from './config/startup-validation.service';
 import { SecretsMaskingService } from './config/secrets-masking.service';
 import { SecretsRotationService } from './config/secrets-rotation.service';
 import { HttpExceptionFilter } from './common/filters/http-exception.filter';
@@ -55,15 +56,35 @@ function validateRequiredEnv(): void {
 let app: INestApplication;
 
 async function bootstrap() {
-  validateRequiredEnv();
+  const bootstrapStart = Date.now();
+  const logger = new Logger('Bootstrap');
 
-  app = await NestFactory.create(AppModule);
+  // ── Phase 1: Pre-DI environment validation ────────────────────────────────
+  // This runs before NestJS creates the DI container, so we can only check
+  // process.env directly. Fail immediately if critical vars are missing.
+  logger.log('Phase 1/4: Validating required environment variables…');
+  validateRequiredEnv();
+  logger.log('Phase 1/4: ✅ Required env vars present');
+
+  // ── Phase 2: Create DI container & core services ──────────────────────────
+  logger.log('Phase 2/4: Creating application container…');
+  const containerStart = Date.now();
+
+  app = await NestFactory.create(AppModule, {
+    logger: process.env.NODE_ENV === 'production'
+      ? ['error', 'warn', 'log']
+      : ['error', 'warn', 'log', 'debug'],
+  });
 
   app.enableShutdownHooks();
 
-  // ── Secrets masking & rotation ───────────────────────────────────────────
-  // Retrieve both services early so they are available before any other
-  // service that might log sensitive information is touched.
+  logger.log(`Phase 2/4: ✅ Container ready (${Date.now() - containerStart}ms)`);
+
+  // ── Phase 3: Configuration validation ────────────────────────────────────
+  // Validates all env vars against the ConfigDto schema (type, range, format).
+  logger.log('Phase 3/4: Running configuration schema validation…');
+  const configStart = Date.now();
+
   const maskingService = app.get(SecretsMaskingService);
   const rotationService = app.get(SecretsRotationService);
 
@@ -72,17 +93,57 @@ async function bootstrap() {
     'Bootstrap',
   );
 
-  // ── Configuration validation ─────────────────────────────────────────────
-  // Validation errors are already masked inside ConfigValidationService,
-  // but we wrap the call here so any unexpected throw is also masked.
   try {
     const configValidationService = app.get(ConfigValidationService);
-    configValidationService.validate();
+    const configResult = configValidationService.validate();
+    logger.log(
+      `Phase 3/4: ✅ Configuration valid (${configResult.warnings.length} warning(s), ${Date.now() - configStart}ms)`,
+    );
   } catch (err) {
     const safeMessage = maskingService.mask((err as Error).message);
-    Logger.error(`Configuration validation failed: ${safeMessage}`, 'Bootstrap');
+    Logger.error(
+      `Phase 3/4: ❌ Configuration validation failed: ${safeMessage}`,
+      'Bootstrap',
+    );
     process.exit(1);
   }
+
+  // ── Phase 4: Dependency connectivity checks ──────────────────────────────
+  // Validates DB, Redis, and Queue configuration at startup with timeouts.
+  logger.log('Phase 4/4: Validating dependency connectivity…');
+  const depStart = Date.now();
+
+  try {
+    const startupValidationService = app.get(StartupValidationService);
+    const report = await startupValidationService.validate({
+      timeoutMs: parseInt(process.env.STARTUP_CHECK_TIMEOUT_MS || '5000', 10),
+      failOnError: process.env.STARTUP_FAIL_ON_DB_ERROR !== 'false',
+    });
+
+    if (report.success) {
+      logger.log(
+        `Phase 4/4: ✅ All dependencies healthy (${Date.now() - depStart}ms)`,
+      );
+    } else {
+      const failedDeps = report.checks
+        .filter((c) => c.status === 'error')
+        .map((c) => c.name)
+        .join(', ');
+      logger.warn(
+        `Phase 4/4: ⚠️  Some dependencies unhealthy (${failedDeps}) — degraded mode`,
+      );
+    }
+  } catch (err) {
+    const safeMessage = maskingService.mask((err as Error).message);
+    Logger.error(
+      `Phase 4/4: ❌ Startup dependency validation failed: ${safeMessage}`,
+      'Bootstrap',
+    );
+    process.exit(1);
+  }
+
+  // ── Post-validation: Configure middleware & guards ────────────────────────
+  logger.log('Configuring middleware and guards…');
 
   // Enable validation globally
   app.useGlobalPipes(
@@ -93,15 +154,11 @@ async function bootstrap() {
     }),
   );
 
-  // ── Error handling & response shaping ───────────────────────────────────
-  // HttpExceptionFilter converts any exception (ApiError or plain HttpException)
-  // into the standard error envelope: { success, statusCode, errorCode, message, ... }.
+  // Error handling & response shaping
   app.useGlobalFilters(new HttpExceptionFilter());
-
-  // ResponseEnvelopeInterceptor wraps every successful response in:
-  // { success: true, statusCode, data, timestamp, path }
   app.useGlobalInterceptors(new ResponseEnvelopeInterceptor());
 
+  // Swagger
   const config = new DocumentBuilder()
     .setTitle('Stellara API')
     .setDescription(
@@ -115,16 +172,22 @@ async function bootstrap() {
   const document = SwaggerModule.createDocument(app, config);
   SwaggerModule.setup('api/docs', app, document);
 
+  // WebSocket adapter
   const redisIoAdapter = new RedisIoAdapter(app);
   await redisIoAdapter.connectToRedis();
-
   app.useWebSocketAdapter(redisIoAdapter);
+
+  // Global guards
   app.useGlobalGuards(app.get(ThrottleGuard));
 
+  // ── Start listening ───────────────────────────────────────────────────────
   const port = process.env.PORT ?? 3000;
   await app.listen(port);
 
-  Logger.log(`Application is running on port ${port}`, 'Bootstrap');
+  const totalTimeMs = Date.now() - bootstrapStart;
+  logger.log(
+    `🚀 Application is running on port ${port} (startup completed in ${totalTimeMs}ms)`,
+  );
 }
 
 bootstrap().catch((err) => {
