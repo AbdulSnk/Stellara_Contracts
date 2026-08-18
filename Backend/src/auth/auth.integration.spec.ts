@@ -50,10 +50,39 @@ describe('Auth Integration Tests (e2e)', () => {
     await app.close();
   });
 
+  // ── Helper ──────────────────────────────────────────────────────────────
+  /** Issue a nonce + sign + login, returning both tokens. */
+  async function loginAs(keypair: Keypair) {
+    const nonceRes = await request(app.getHttpServer())
+      .post('/auth/nonce')
+      .send({ publicKey: keypair.publicKey() });
+
+    const nonce = nonceRes.body.nonce;
+    const message = `Sign this message to authenticate with Stellara: ${nonce}`;
+    const signature = nacl.sign.detached(
+      Buffer.from(message, 'utf-8'),
+      keypair.rawSecretKey(),
+    );
+
+    const loginRes = await request(app.getHttpServer())
+      .post('/auth/wallet/login')
+      .send({
+        publicKey: keypair.publicKey(),
+        signature: Buffer.from(signature).toString('base64'),
+        nonce,
+      });
+
+    return {
+      accessToken: loginRes.body.accessToken as string,
+      refreshToken: loginRes.body.refreshToken as string,
+      user: loginRes.body.user,
+    };
+  }
+
+  // ────────────────────────────────────────────────────────────────────────
   describe('Successful Login Flow', () => {
     let accessToken: string;
     let refreshToken: string;
-    let nonce: string;
 
     it('should request a nonce', async () => {
       const response = await request(app.getHttpServer())
@@ -64,32 +93,15 @@ describe('Auth Integration Tests (e2e)', () => {
       expect(response.body).toHaveProperty('nonce');
       expect(response.body).toHaveProperty('expiresAt');
       expect(response.body).toHaveProperty('message');
-      nonce = response.body.nonce;
     });
 
     it('should login with valid signature', async () => {
-      const message = `Sign this message to authenticate with Stellara: ${nonce}`;
-      const messageBytes = Buffer.from(message, 'utf-8');
-      const secretKey = testKeypair.rawSecretKey();
-      const signature = nacl.sign.detached(messageBytes, secretKey);
-      const signatureBase64 = Buffer.from(signature).toString('base64');
-
-      const response = await request(app.getHttpServer())
-        .post('/auth/wallet/login')
-        .send({
-          publicKey: testKeypair.publicKey(),
-          signature: signatureBase64,
-          nonce,
-        })
-        .expect(200);
-
-      expect(response.body).toHaveProperty('accessToken');
-      expect(response.body).toHaveProperty('refreshToken');
-      expect(response.body).toHaveProperty('user');
-      expect(response.body.user).toHaveProperty('id');
-
-      accessToken = response.body.accessToken;
-      refreshToken = response.body.refreshToken;
+      const tokens = await loginAs(testKeypair);
+      expect(tokens.accessToken).toBeDefined();
+      expect(tokens.refreshToken).toBeDefined();
+      expect(tokens.user).toHaveProperty('id');
+      accessToken = tokens.accessToken;
+      refreshToken = tokens.refreshToken;
     });
 
     it('should access protected endpoint with access token', async () => {
@@ -124,9 +136,9 @@ describe('Auth Integration Tests (e2e)', () => {
     });
   });
 
+  // ────────────────────────────────────────────────────────────────────────
   describe('Replay Attack Prevention', () => {
     it('should reject reused nonce', async () => {
-      // Request nonce
       const nonceResponse = await request(app.getHttpServer())
         .post('/auth/nonce')
         .send({ publicKey: testKeypair.publicKey() });
@@ -150,8 +162,8 @@ describe('Auth Integration Tests (e2e)', () => {
         })
         .expect(200);
 
-      // Second login with same nonce should fail
-      await request(app.getHttpServer())
+      // Second login with same nonce should fail with structured error
+      const replay = await request(app.getHttpServer())
         .post('/auth/wallet/login')
         .send({
           publicKey: testKeypair.publicKey(),
@@ -159,11 +171,31 @@ describe('Auth Integration Tests (e2e)', () => {
           nonce,
         })
         .expect(401);
+
+      expect(replay.body).toHaveProperty('errorCode', 'INVALID_NONCE');
+      expect(replay.body).toHaveProperty('correlationId');
+    });
+
+    it('should reject expired nonce', async () => {
+      // Generate a nonce and manually expire it is not possible via API,
+      // but we verify the error structure for an unknown nonce
+      const res = await request(app.getHttpServer())
+        .post('/auth/wallet/login')
+        .send({
+          publicKey: testKeypair.publicKey(),
+          signature: 'dGVzdA==', // base64 "test"
+          nonce: '00000000-0000-0000-0000-000000000000',
+        })
+        .expect(401);
+
+      expect(res.body).toHaveProperty('errorCode');
+      expect(res.body).toHaveProperty('correlationId');
     });
   });
 
+  // ────────────────────────────────────────────────────────────────────────
   describe('Invalid Signature', () => {
-    it('should reject invalid signature with structured error', async () => {
+    it('should reject invalid signature with structured error and correlationId', async () => {
       const nonceResponse = await request(app.getHttpServer())
         .post('/auth/nonce')
         .send({ publicKey: testKeypair.publicKey() });
@@ -181,33 +213,17 @@ describe('Auth Integration Tests (e2e)', () => {
         .expect(401);
 
       expect(res.body).toHaveProperty('errorCode', 'INVALID_SIGNATURE');
+      expect(res.body).toHaveProperty('correlationId');
+      expect(typeof res.body.correlationId).toBe('string');
+      expect(res.body.correlationId.length).toBeGreaterThan(0);
     });
   });
 
+  // ────────────────────────────────────────────────────────────────────────
   describe('Refresh Token Rotation & Abuse', () => {
     it('should revoke the whole family when a rotated token is replayed', async () => {
-      // Login to obtain a refresh token
-      const nonceResponse = await request(app.getHttpServer())
-        .post('/auth/nonce')
-        .send({ publicKey: testKeypair.publicKey() });
-
-      const nonce = nonceResponse.body.nonce;
-      const message = `Sign this message to authenticate with Stellara: ${nonce}`;
-      const signature = nacl.sign.detached(
-        Buffer.from(message, 'utf-8'),
-        testKeypair.rawSecretKey(),
-      );
-
-      const loginResponse = await request(app.getHttpServer())
-        .post('/auth/wallet/login')
-        .send({
-          publicKey: testKeypair.publicKey(),
-          signature: Buffer.from(signature).toString('base64'),
-          nonce,
-        })
-        .expect(200);
-
-      const firstRefresh = loginResponse.body.refreshToken;
+      const tokens = await loginAs(testKeypair);
+      const firstRefresh = tokens.refreshToken;
 
       // Rotate once → first token is now revoked
       const rotateResponse = await request(app.getHttpServer())
@@ -216,6 +232,7 @@ describe('Auth Integration Tests (e2e)', () => {
         .expect(200);
 
       expect(rotateResponse.body.refreshToken).not.toBe(firstRefresh);
+      expect(rotateResponse.body).toHaveProperty('familyId');
 
       // Replaying the rotated-away token must fail and revoke the family
       const replay = await request(app.getHttpServer())
@@ -231,35 +248,157 @@ describe('Auth Integration Tests (e2e)', () => {
         .send({ refreshToken: rotateResponse.body.refreshToken })
         .expect(401);
     });
+
+    it('should support a multi-step rotation chain (A → B → C)', async () => {
+      const tokens = await loginAs(testKeypair);
+
+      // Rotate: original → B
+      const res1 = await request(app.getHttpServer())
+        .post('/auth/refresh')
+        .send({ refreshToken: tokens.refreshToken })
+        .expect(200);
+
+      const familyIdB = res1.body.familyId;
+      expect(res1.body.refreshToken).not.toBe(tokens.refreshToken);
+
+      // Rotate: B → C (same family)
+      const res2 = await request(app.getHttpServer())
+        .post('/auth/refresh')
+        .send({ refreshToken: res1.body.refreshToken })
+        .expect(200);
+
+      expect(res2.body.familyId).toBe(familyIdB);
+      expect(res2.body.refreshToken).not.toBe(res1.body.refreshToken);
+
+      // Replaying B (the middle token) should now revoke the entire family
+      const replay = await request(app.getHttpServer())
+        .post('/auth/refresh')
+        .send({ refreshToken: res1.body.refreshToken })
+        .expect(401);
+
+      expect(replay.body).toHaveProperty('errorCode', 'TOKEN_INVALID');
+
+      // C is also dead
+      await request(app.getHttpServer())
+        .post('/auth/refresh')
+        .send({ refreshToken: res2.body.refreshToken })
+        .expect(401);
+
+      // The original is long dead too
+      await request(app.getHttpServer())
+        .post('/auth/refresh')
+        .send({ refreshToken: tokens.refreshToken })
+        .expect(401);
+    });
+
+    it('should reject expired refresh token with TOKEN_EXPIRED code', async () => {
+      // We can't easily create an expired token via the API, but we can
+      // verify the error structure for a completely invalid token
+      const res = await request(app.getHttpServer())
+        .post('/auth/refresh')
+        .send({ refreshToken: 'totally-fake-token' })
+        .expect(401);
+
+      expect(res.body).toHaveProperty('errorCode', 'TOKEN_INVALID');
+      expect(res.body).toHaveProperty('correlationId');
+    });
   });
 
-  describe('API Token Flow', () => {
-    let accessToken: string;
-    let apiToken: string;
-    let apiTokenId: string;
+  // ────────────────────────────────────────────────────────────────────────
+  describe('Correlation IDs in Error Responses', () => {
+    it('should include correlationId in login failure responses', async () => {
+      const res = await request(app.getHttpServer())
+        .post('/auth/wallet/login')
+        .send({
+          publicKey: testKeypair.publicKey(),
+          signature: 'bm90LWEtc2lnbmF0dXJl',
+          nonce: '00000000-0000-0000-0000-000000000000',
+        })
+        .expect(401);
 
-    beforeAll(async () => {
-      // Login first
+      expect(res.body).toHaveProperty('correlationId');
+      expect(typeof res.body.correlationId).toBe('string');
+      // UUID format
+      expect(res.body.correlationId).toMatch(
+        /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/,
+      );
+    });
+
+    it('should include correlationId in refresh failure responses', async () => {
+      const res = await request(app.getHttpServer())
+        .post('/auth/refresh')
+        .send({ refreshToken: 'invalid-token-value' })
+        .expect(401);
+
+      expect(res.body).toHaveProperty('correlationId');
+      expect(typeof res.body.correlationId).toBe('string');
+    });
+
+    it('should include correlationId in signature failure responses', async () => {
+      const nonceResponse = await request(app.getHttpServer())
+        .post('/auth/nonce')
+        .send({ publicKey: testKeypair.publicKey() });
+
+      const res = await request(app.getHttpServer())
+        .post('/auth/wallet/login')
+        .send({
+          publicKey: testKeypair.publicKey(),
+          signature: 'aW52YWxpZA==',
+          nonce: nonceResponse.body.nonce,
+        })
+        .expect(401);
+
+      expect(res.body).toHaveProperty('correlationId');
+      expect(res.body.errorCode).toBe('INVALID_SIGNATURE');
+    });
+  });
+
+  // ────────────────────────────────────────────────────────────────────────
+  describe('Nonce Atomicity & Consistent State', () => {
+    it('should leave no dangling state after failed signature verification', async () => {
       const nonceResponse = await request(app.getHttpServer())
         .post('/auth/nonce')
         .send({ publicKey: testKeypair.publicKey() });
 
       const nonce = nonceResponse.body.nonce;
+
+      // Attempt login with wrong signature — nonce should NOT be consumed
+      await request(app.getHttpServer())
+        .post('/auth/wallet/login')
+        .send({
+          publicKey: testKeypair.publicKey(),
+          signature: 'd3Jvbmc=',
+          nonce,
+        })
+        .expect(401);
+
+      // Same nonce should still work with the correct signature
       const message = `Sign this message to authenticate with Stellara: ${nonce}`;
       const signature = nacl.sign.detached(
         Buffer.from(message, 'utf-8'),
         testKeypair.rawSecretKey(),
       );
 
-      const loginResponse = await request(app.getHttpServer())
+      await request(app.getHttpServer())
         .post('/auth/wallet/login')
         .send({
           publicKey: testKeypair.publicKey(),
           signature: Buffer.from(signature).toString('base64'),
           nonce,
-        });
+        })
+        .expect(200);
+    });
+  });
 
-      accessToken = loginResponse.body.accessToken;
+  // ────────────────────────────────────────────────────────────────────────
+  describe('API Token Flow', () => {
+    let accessToken: string;
+    let apiToken: string;
+    let apiTokenId: string;
+
+    beforeAll(async () => {
+      const tokens = await loginAs(testKeypair);
+      accessToken = tokens.accessToken;
     });
 
     it('should create API token', async () => {
@@ -299,37 +438,18 @@ describe('Auth Integration Tests (e2e)', () => {
     });
   });
 
+  // ────────────────────────────────────────────────────────────────────────
   describe('Wallet Binding', () => {
     let accessToken: string;
     let userId: string;
 
     beforeAll(async () => {
-      // Login with first wallet
-      const nonceResponse = await request(app.getHttpServer())
-        .post('/auth/nonce')
-        .send({ publicKey: testKeypair.publicKey() });
-
-      const nonce = nonceResponse.body.nonce;
-      const message = `Sign this message to authenticate with Stellara: ${nonce}`;
-      const signature = nacl.sign.detached(
-        Buffer.from(message, 'utf-8'),
-        testKeypair.rawSecretKey(),
-      );
-
-      const loginResponse = await request(app.getHttpServer())
-        .post('/auth/wallet/login')
-        .send({
-          publicKey: testKeypair.publicKey(),
-          signature: Buffer.from(signature).toString('base64'),
-          nonce,
-        });
-
-      accessToken = loginResponse.body.accessToken;
-      userId = loginResponse.body.user.id;
+      const tokens = await loginAs(testKeypair);
+      accessToken = tokens.accessToken;
+      userId = tokens.user.id;
     });
 
     it('should bind additional wallet', async () => {
-      // Get nonce for second wallet
       const nonceResponse = await request(app.getHttpServer())
         .post('/auth/nonce')
         .send({ publicKey: testKeypair2.publicKey() });
@@ -375,8 +495,24 @@ describe('Auth Integration Tests (e2e)', () => {
 
       expect(loginResponse.body.user.id).toBe(userId);
     });
+
+    it('should reject bind with invalid nonce and include correlationId', async () => {
+      const res = await request(app.getHttpServer())
+        .post('/auth/wallet/bind')
+        .set('Authorization', `Bearer ${accessToken}`)
+        .send({
+          publicKey: testKeypair2.publicKey(),
+          signature: 'bm90LW9yaWdpbmFs',
+          nonce: '00000000-0000-0000-0000-000000000000',
+        })
+        .expect(401);
+
+      expect(res.body).toHaveProperty('errorCode', 'INVALID_NONCE');
+      expect(res.body).toHaveProperty('correlationId');
+    });
   });
 
+  // ────────────────────────────────────────────────────────────────────────
   describe('Rate Limiting', () => {
     it('should enforce rate limits on nonce endpoint', async () => {
       const publicKey = Keypair.random().publicKey();

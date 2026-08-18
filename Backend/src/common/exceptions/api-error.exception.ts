@@ -19,6 +19,7 @@ export enum ApiErrorCode {
   INVALID_NONCE = 'INVALID_NONCE',
   TOKEN_EXPIRED = 'TOKEN_EXPIRED',
   TOKEN_INVALID = 'TOKEN_INVALID',
+  TOKEN_FAMILY_ABUSE = 'TOKEN_FAMILY_ABUSE',
   INSUFFICIENT_ROLE = 'INSUFFICIENT_ROLE',
 
   // --- Rate-limiting ---
@@ -48,6 +49,8 @@ export interface ApiErrorBody {
   message: string;
   /** Optional machine-readable details (e.g. validation field errors). */
   details?: unknown;
+  /** Correlation ID for tracing failed requests across services. */
+  correlationId?: string;
   timestamp: string;
   path?: string;
 }
@@ -61,16 +64,19 @@ export interface ApiErrorBody {
 export class ApiError extends HttpException {
   public readonly errorCode: ApiErrorCode | string;
   public readonly details?: unknown;
+  public readonly correlationId?: string;
 
   constructor(
     statusCode: HttpStatus,
     errorCode: ApiErrorCode | string,
     message: string,
     details?: unknown,
+    correlationId?: string,
   ) {
-    super({ errorCode, message, details }, statusCode);
+    super({ errorCode, message, details, correlationId }, statusCode);
     this.errorCode = errorCode;
     this.details = details;
+    this.correlationId = correlationId;
   }
 }
 

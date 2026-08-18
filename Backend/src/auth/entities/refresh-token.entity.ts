@@ -35,6 +35,13 @@ export class RefreshToken {
   @Column({ type: 'timestamp', nullable: true })
   revokedAt?: Date;
 
+  /**
+   * Why the token was revoked (e.g. 'logout', 'expired', 'reuse_detected',
+   * 'family_abuse'). Stored for audit traceability.
+   */
+  @Column({ type: 'varchar', nullable: true })
+  revokedReason?: string | null;
+
   @Column({ type: 'timestamp', nullable: true })
   replacedAt?: Date;
 

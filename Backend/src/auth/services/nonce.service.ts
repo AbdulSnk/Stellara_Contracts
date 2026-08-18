@@ -78,10 +78,11 @@ export class NonceService {
         throw new InvalidNonceError('Nonce expired');
       }
 
+      const consumedAt = new Date();
       const updateResult = await repo
         .createQueryBuilder()
         .update(LoginNonce)
-        .set({ used: true })
+        .set({ used: true, consumedAt })
         .where('nonce = :nonce AND publicKey = :publicKey AND used = false', {
           nonce,
           publicKey,
