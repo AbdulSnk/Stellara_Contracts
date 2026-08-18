@@ -49,18 +49,18 @@ contract RevocationRegistry is Ownable {
     // ── Single operations ─────────────────────────────────────────────
 
     /// @dev Set revocation status for a single token (permanent revocation).
-    function setRevoked(address tokenContract, uint256 tokenId, bool isRevoked) external onlyOwner {
-        _setRevoked(tokenContract, tokenId, isRevoked, 0, "");
+    function setRevoked(address tokenContract, uint256 tokenId, bool isTokenRevoked) external onlyOwner {
+        _setRevoked(tokenContract, tokenId, isTokenRevoked, 0, "");
     }
 
     /// @dev Set revocation with a specific reason and timestamp tracking.
     function setRevokedWithReason(
         address tokenContract,
         uint256 tokenId,
-        bool isRevoked,
-        string calldata reason
+        bool isTokenRevoked,
+        string memory reason
     ) external onlyOwner {
-        _setRevoked(tokenContract, tokenId, isRevoked, 0, reason);
+        _setRevoked(tokenContract, tokenId, isTokenRevoked, 0, reason);
     }
 
     /// @dev Set revocation with an expiry timestamp.
@@ -68,21 +68,21 @@ contract RevocationRegistry is Ownable {
     function setRevokedWithExpiry(
         address tokenContract,
         uint256 tokenId,
-        bool isRevoked,
+        bool isTokenRevoked,
         uint256 expiry
     ) external onlyOwner {
-        _setRevoked(tokenContract, tokenId, isRevoked, expiry, "");
+        _setRevoked(tokenContract, tokenId, isTokenRevoked, expiry, "");
     }
 
     /// @dev Set revocation with expiry and reason.
     function setRevokedWithExpiryAndReason(
         address tokenContract,
         uint256 tokenId,
-        bool isRevoked,
+        bool isTokenRevoked,
         uint256 expiry,
-        string calldata reason
+        string memory reason
     ) external onlyOwner {
-        _setRevoked(tokenContract, tokenId, isRevoked, expiry, reason);
+        _setRevoked(tokenContract, tokenId, isTokenRevoked, expiry, reason);
     }
 
     // ── Batch operations ──────────────────────────────────────────────
@@ -91,11 +91,11 @@ contract RevocationRegistry is Ownable {
     function batchSetRevoked(
         address tokenContract,
         uint256[] calldata tokenIds,
-        bool[] calldata isRevoked
+        bool[] calldata isTokenRevoked
     ) external onlyOwner {
-        require(tokenIds.length == isRevoked.length, "array length mismatch");
+        require(tokenIds.length == isTokenRevoked.length, "array length mismatch");
         for (uint256 i = 0; i < tokenIds.length; ) {
-            _setRevoked(tokenContract, tokenIds[i], isRevoked[i], 0, "");
+            _setRevoked(tokenContract, tokenIds[i], isTokenRevoked[i], 0, "");
             unchecked { ++i; }
         }
     }
@@ -104,13 +104,13 @@ contract RevocationRegistry is Ownable {
     function batchSetRevokedWithExpiry(
         address tokenContract,
         uint256[] calldata tokenIds,
-        bool[] calldata isRevoked,
+        bool[] calldata isTokenRevoked,
         uint256[] calldata expiries
     ) external onlyOwner {
-        require(tokenIds.length == isRevoked.length, "array length mismatch");
+        require(tokenIds.length == isTokenRevoked.length, "array length mismatch");
         require(tokenIds.length == expiries.length, "expiry array length mismatch");
         for (uint256 i = 0; i < tokenIds.length; ) {
-            _setRevoked(tokenContract, tokenIds[i], isRevoked[i], expiries[i], "");
+            _setRevoked(tokenContract, tokenIds[i], isTokenRevoked[i], expiries[i], "");
             unchecked { ++i; }
         }
     }
@@ -120,15 +120,15 @@ contract RevocationRegistry is Ownable {
         address tokenContract,
         uint256 fromTokenId,
         uint256 toTokenId,
-        bool isRevoked
+        bool isTokenRevoked
     ) external onlyOwner {
         require(fromTokenId <= toTokenId, "invalid range");
         uint256 count = 0;
         for (uint256 i = fromTokenId; i <= toTokenId; ) {
-            _setRevoked(tokenContract, i, isRevoked, 0, "");
+            _setRevoked(tokenContract, i, isTokenRevoked, 0, "");
             unchecked { ++i; ++count; }
         }
-        if (isRevoked) {
+        if (isTokenRevoked) {
             emit RevocationBatchSet(tokenContract, fromTokenId, count, 0);
         }
     }
@@ -138,16 +138,16 @@ contract RevocationRegistry is Ownable {
         address tokenContract,
         uint256 fromTokenId,
         uint256 toTokenId,
-        bool isRevoked,
+        bool isTokenRevoked,
         uint256 expiry
     ) external onlyOwner {
         require(fromTokenId <= toTokenId, "invalid range");
         uint256 count = 0;
         for (uint256 i = fromTokenId; i <= toTokenId; ) {
-            _setRevoked(tokenContract, i, isRevoked, expiry, "");
+            _setRevoked(tokenContract, i, isTokenRevoked, expiry, "");
             unchecked { ++i; ++count; }
         }
-        if (isRevoked) {
+        if (isTokenRevoked) {
             emit RevocationBatchSet(tokenContract, fromTokenId, count, expiry);
         }
     }
@@ -164,7 +164,7 @@ contract RevocationRegistry is Ownable {
     function batchRevokeWithReason(
         address tokenContract,
         uint256[] calldata tokenIds,
-        string calldata reason
+        string memory reason
     ) external onlyOwner {
         for (uint256 i = 0; i < tokenIds.length; ) {
             _setRevoked(tokenContract, tokenIds[i], true, 0, reason);
@@ -184,9 +184,7 @@ contract RevocationRegistry is Ownable {
     function clearAll(address tokenContract) external onlyOwner {
         uint256 count = revokedCount[tokenContract];
         if (count == 0) return;
-        // Reset bitmap buckets — we need to scan all occupied buckets
-        // Use the maximum possible bucket index based on the bitmap keys
-        // For safety, iterate up to (count + 255) / 256 buckets
+        // Reset bitmap buckets — iterate enough to cover all possible buckets
         uint256 buckets = (count + 255) / 256;
         for (uint256 i = 0; i < buckets; ) {
             _revokedBitmap[tokenContract][i] = 0;
@@ -246,9 +244,9 @@ contract RevocationRegistry is Ownable {
     function _setRevoked(
         address tokenContract,
         uint256 tokenId,
-        bool isRevoked,
+        bool isTokenRevoked,
         uint256 expiry,
-        string calldata reason
+        string memory reason
     ) private {
         uint256 bucket = tokenId / 256;
         uint256 bit = tokenId % 256;
@@ -256,8 +254,8 @@ contract RevocationRegistry is Ownable {
         uint256 current = _revokedBitmap[tokenContract][bucket];
         bool currentlyRevoked = (current >> bit) & 1 == 1;
 
-        if (isRevoked != currentlyRevoked) {
-            if (isRevoked) {
+        if (isTokenRevoked != currentlyRevoked) {
+            if (isTokenRevoked) {
                 _revokedBitmap[tokenContract][bucket] = current | mask;
                 revokedCount[tokenContract]++;
                 revocationExpiry[tokenContract][tokenId] = expiry;
@@ -275,7 +273,7 @@ contract RevocationRegistry is Ownable {
                 delete revocationTimestamp[tokenContract][tokenId];
                 delete revocationReason[tokenContract][tokenId];
             }
-            emit RevocationSet(tokenContract, tokenId, isRevoked, expiry);
+            emit RevocationSet(tokenContract, tokenId, isTokenRevoked, expiry);
         }
     }
 }

@@ -84,7 +84,7 @@ contract SoulboundCredential is ERC721, Ownable {
     }
 
     /// @dev Issuer can revoke with a specific reason.  Records revocation timestamp.
-    function revokeWithReason(uint256 tokenId, string calldata reason) external onlyOwner onlyRevocable(tokenId) {
+    function revokeWithReason(uint256 tokenId, string memory reason) external onlyOwner onlyRevocable(tokenId) {
         _revoke(tokenId, reason);
     }
 
@@ -170,13 +170,13 @@ contract SoulboundCredential is ERC721, Ownable {
     }
 
     /// @dev Returns the full revocation record: (revoked, timestamp, reason).
-    function revocationRecord(uint256 tokenId) external view returns (bool isRevoked, uint64 timestamp, string memory reason) {
+    function revocationRecord(uint256 tokenId) external view returns (bool revoked_, uint64 timestamp_, string memory reason_) {
         return (revoked[tokenId], revokedAt[tokenId], revocationReason[tokenId]);
     }
 
     // ── Internal ──────────────────────────────────────────────────────
 
-    function _revoke(uint256 tokenId, string calldata reason) private {
+    function _revoke(uint256 tokenId, string memory reason) private {
         revoked[tokenId] = true;
         revokedAt[tokenId] = uint64(block.timestamp);
         revocationReason[tokenId] = reason;
