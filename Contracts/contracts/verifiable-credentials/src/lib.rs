@@ -447,8 +447,8 @@ impl VerifiableCredentialsContract {
             CredentialReissuedEvent {
                 old_credential_id,
                 new_credential_id: new_cred_id.clone(),
-                issuer: issuer_did,
-                new_subject: new_subject_did,
+                issuer: issuer_did.clone(),
+                new_subject: new_subject_did.clone(),
                 old_subject,
                 timestamp: env.ledger().timestamp(),
             },
@@ -459,7 +459,7 @@ impl VerifiableCredentialsContract {
             (extended_topics::CREDENTIAL_ISSUED,),
             CredentialIssuedEvent {
                 credential_id: new_cred_id.clone(),
-                issuer_did: issuer_did.clone(),
+                issuer_did,
                 subject_did: new_subject_did,
                 credential_type: type_tag,
                 timestamp: env.ledger().timestamp(),
