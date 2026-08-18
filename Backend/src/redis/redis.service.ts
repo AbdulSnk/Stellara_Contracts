@@ -129,4 +129,68 @@ export class RedisService implements OnModuleInit, OnModuleDestroy {
     const result = await this.client.expire(key, ttlSeconds);
     return result === 1;
   }
+
+  /**
+   * Execute a Lua script atomically on the Redis server.
+   * Lua scripts run as a single, uninterruptible command — ideal for
+   * read-modify-write sequences that must not race.
+   */
+  async evalScript<T = unknown>(
+    script: string,
+    keys: string[],
+    args: (string | number)[] = [],
+  ): Promise<T> {
+    return this.client.eval(script, {
+      keys,
+      arguments: args.map(String),
+    }) as Promise<T>;
+  }
+
+  /**
+   * Scan and delete keys matching a glob pattern that were last written
+   * more than `olderThanMs` milliseconds ago (based on IDLETIME from
+   * OBJECT IDLETIME, falling back to TTL-based heuristic).
+   *
+   * This is used to purge orphaned socket-tracking keys whose owning
+   * connection is gone but whose TTL was inadvertently refreshed.
+   */
+  async purgeStaleKeys(
+    pattern: string,
+    olderThanSeconds: number,
+  ): Promise<string[]> {
+    const keys = await this.scanKeys(pattern);
+    if (keys.length === 0) return [];
+
+    const now = Date.now();
+    const stale: string[] = [];
+
+    // Use pipeline for batch TTL checks
+    const pipeline = this.client.multi();
+    for (const k of keys) {
+      pipeline.ttl(k);
+    }
+    const ttlResults = (await pipeline.exec()) as unknown as (number | null)[];
+
+    for (let i = 0; i < keys.length; i++) {
+      const ttl = ttlResults[i];
+      // ttl === -1 means key exists but has no expiry — treat as stale
+      // ttl === -2 means key already gone — skip
+      // ttl >= 0 && ttl <= threshold — key is about to expire or has
+      //   been idle long enough
+      if (ttl !== null && (ttl === -1 || ttl <= olderThanSeconds)) {
+        stale.push(keys[i]);
+      }
+    }
+
+    if (stale.length > 0) {
+      const delPipeline = this.client.multi();
+      for (const k of stale) {
+        delPipeline.del(k);
+      }
+      await delPipeline.exec();
+      this.logger.debug(`Purged ${stale.length} stale keys matching ${pattern}`);
+    }
+
+    return stale;
+  }
 }
