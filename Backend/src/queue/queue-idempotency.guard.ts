@@ -16,11 +16,26 @@ export class QueueIdempotencyGuard {
    * Generate an idempotency key from job type + payload.
    */
   generateIdempotencyKey(jobType: string, payload: Record<string, any>): string {
-    const canonical = JSON.stringify(
-      { jobType, payload },
-      Object.keys({ jobType, payload }).sort(),
-    );
+    const canonical = JSON.stringify({
+      jobType,
+      payload: this.sortKeys(payload),
+    });
     return crypto.createHash('sha256').update(canonical).digest('hex');
+  }
+
+  /**
+   * Recursively sort object keys so that key order differences do not
+   * produce different hashes for semantically identical payloads.
+   */
+  private sortKeys(obj: any): any {
+    if (obj === null || typeof obj !== 'object') return obj;
+    if (Array.isArray(obj)) return obj.map((item) => this.sortKeys(item));
+    return Object.keys(obj)
+      .sort()
+      .reduce((sorted: Record<string, any>, key) => {
+        sorted[key] = this.sortKeys(obj[key]);
+        return sorted;
+      }, {});
   }
 
   /**
