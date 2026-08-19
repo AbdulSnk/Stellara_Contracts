@@ -1,6 +1,8 @@
 import { Test, TestingModule } from '@nestjs/testing';
 import { getQueueToken } from '@nestjs/bull';
 import { DeployContractProcessor } from './deploy-contract.processor';
+import { QueueIdempotencyGuard } from '../queue-idempotency.guard';
+import { QueueJobTracingWrapper } from '../../observability/middleware/queue-job-tracing.wrapper';
 
 describe('DeployContractProcessor', () => {
   let processor: DeployContractProcessor;
@@ -26,6 +28,19 @@ describe('DeployContractProcessor', () => {
       providers: [
         DeployContractProcessor,
         { provide: getQueueToken('failed-jobs'), useValue: { add: jest.fn() } },
+        {
+          provide: QueueIdempotencyGuard,
+          useValue: {
+            isDuplicate: jest.fn().mockResolvedValue({ isDuplicate: false }),
+            generateIdempotencyKey: jest.fn().mockReturnValue('mock-key'),
+          },
+        },
+        {
+          provide: QueueJobTracingWrapper,
+          useValue: {
+            wrapProcessor: jest.fn().mockImplementation((fn: any) => fn),
+          },
+        },
       ],
     }).compile();
 
