@@ -10,6 +10,9 @@ use soroban_sdk::{
     contract, contractimpl, contracttype, symbol_short, Address, Bytes, BytesN, Env, Symbol, Vec,
 };
 
+mod risk_management;
+use risk_management::{RiskManager, RiskTier, RiskMetadata, TieredCircuitBreakerState};
+
 /// Version of this contract implementation
 const CONTRACT_VERSION: u32 = 1;
 
@@ -51,6 +54,7 @@ pub struct Trade {
     pub signed_amount: i128,
     pub price: i128,
     pub timestamp: u64,
+    pub risk_metadata: RiskMetadata,
 }
 
 #[contracttype]
@@ -90,6 +94,7 @@ pub struct LimitOrder {
     pub status: OrderStatus,
     pub tif: TimeInForce,
     pub timestamp: u64,
+    pub risk_metadata: RiskMetadata,
 }
 
 /// Trading statistics
@@ -252,6 +257,11 @@ pub enum TradeError {
     SolvencyProofExpired = 3019,
     PrivateTradeNotFound = 3020,
     AuditUnauthorized = 3021,
+    PositionLimitExceeded = 3022,
+    DailyVolumeExceeded = 3023,
+    LiquidityInsufficient = 3024,
+    CircuitBreakerTriggered = 3025,
+    SlippageExceeded = 3026,
 }
 
 impl From<TradeError> for soroban_sdk::Error {
@@ -610,6 +620,7 @@ fn record_trade(
     amount: i128,
     price: i128,
     is_buy: bool,
+    pool_liquidity: i128,
 ) -> u64 {
     let storage = env.storage().persistent();
     let current_timestamp = env.ledger().timestamp();
@@ -621,6 +632,9 @@ fn record_trade(
         total_volume: 0,
     });
 
+    // Generate risk metadata
+    let risk_metadata = RiskManager::generate_risk_metadata(env, trader, pool_liquidity, amount, price);
+
     let trade = Trade {
         id: trade_id,
         trader: trader.clone(),
@@ -628,6 +642,7 @@ fn record_trade(
         signed_amount,
         price,
         timestamp: current_timestamp,
+        risk_metadata,
     };
 
     let trade_key = (symbol_short!("trade"), trade_id);
@@ -685,7 +700,9 @@ fn execute_trade_batch(
     let mut trade_ids = Vec::new(env);
 
     for (pair, amount, price, is_buy) in orders.iter() {
-        let trade_id = record_trade(env, trader, &pair, amount, price, is_buy);
+        // Use a large default liquidity for batch trades (simplified approach)
+        let pool_liquidity = 100_000_000i128;
+        let trade_id = record_trade(env, trader, &pair, amount, price, is_buy, pool_liquidity);
         trade_ids.push_back(trade_id);
     }
 
@@ -764,6 +781,9 @@ fn match_limit_order(env: &Env, incoming: &mut LimitOrder) -> Result<(), TradeEr
         let incoming_is_buy = incoming.side == OrderSide::Buy;
         let maker_is_buy = maker.side == OrderSide::Buy;
 
+        // Use a large default liquidity for order matching (simplified approach)
+        let pool_liquidity = 100_000_000i128;
+
         record_trade(
             env,
             &incoming.owner,
@@ -771,6 +791,7 @@ fn match_limit_order(env: &Env, incoming: &mut LimitOrder) -> Result<(), TradeEr
             fill_amount,
             execution_price,
             incoming_is_buy,
+            pool_liquidity,
         );
 
         record_trade(
@@ -780,6 +801,7 @@ fn match_limit_order(env: &Env, incoming: &mut LimitOrder) -> Result<(), TradeEr
             fill_amount,
             execution_price,
             maker_is_buy,
+            pool_liquidity,
         );
 
         env.events().publish(
@@ -847,6 +869,9 @@ impl UpgradeableTradingContract {
         // Initialize circuit breaker
         CircuitBreaker::init(&env, cb_config);
 
+        // Initialize risk manager
+        RiskManager::init(&env);
+
         Ok(())
     }
 
@@ -861,6 +886,7 @@ impl UpgradeableTradingContract {
         fee_token: Address,
         fee_amount: i128,
         fee_recipient: Address,
+        pool_liquidity: i128,
     ) -> Result<u64, TradeError> {
         trader.require_auth();
 
@@ -875,10 +901,33 @@ impl UpgradeableTradingContract {
         let _storage = ensure_tradeable(&env, &trader)?;
         CircuitBreaker::track_activity(&env, amount);
 
+        // Risk checks
+        if !RiskManager::check_position_limit(&env, &trader, amount) {
+            return Err(TradeError::PositionLimitExceeded);
+        }
+
+        if !RiskManager::check_daily_volume(&env, &trader, amount) {
+            return Err(TradeError::DailyVolumeExceeded);
+        }
+
+        let liquidity_check = RiskManager::check_liquidity(&env, &trader, pool_liquidity, amount);
+        if !liquidity_check.passed {
+            return Err(TradeError::LiquidityInsufficient);
+        }
+
+        if !RiskManager::check_circuit_breaker(&env, &trader, price) {
+            return Err(TradeError::CircuitBreakerTriggered);
+        }
+
         FeeManager::collect_fee(&env, &fee_token, &trader, &fee_recipient, fee_amount)
             .map_err(|_| TradeError::InsufficientBalance)?;
 
-        let trade_id = record_trade(&env, &trader, &pair, amount, price, is_buy);
+        let trade_id = record_trade(&env, &trader, &pair, amount, price, is_buy, pool_liquidity);
+
+        // Consume daily volume and update position
+        RiskManager::consume_daily_volume(&env, &trader, amount);
+        let position_delta = if is_buy { amount } else { -amount };
+        RiskManager::update_position_size(&env, &trader, position_delta);
 
         env.events().publish(
             (symbol_short!("fee_col"),),
@@ -903,6 +952,7 @@ impl UpgradeableTradingContract {
         price: i128,
         amount: i128,
         tif: TimeInForce,
+        pool_liquidity: i128,
     ) -> Result<u64, TradeError> {
         trader.require_auth();
         require_initialized(&env)?;
@@ -917,6 +967,24 @@ impl UpgradeableTradingContract {
             return Err(TradeError::InvalidPrice);
         }
 
+        // Risk checks
+        if !RiskManager::check_position_limit(&env, &trader, amount) {
+            return Err(TradeError::PositionLimitExceeded);
+        }
+
+        if !RiskManager::check_daily_volume(&env, &trader, amount) {
+            return Err(TradeError::DailyVolumeExceeded);
+        }
+
+        let liquidity_check = RiskManager::check_liquidity(&env, &trader, pool_liquidity, amount);
+        if !liquidity_check.passed {
+            return Err(TradeError::LiquidityInsufficient);
+        }
+
+        if !RiskManager::check_circuit_breaker(&env, &trader, price) {
+            return Err(TradeError::CircuitBreakerTriggered);
+        }
+
         let side = if is_buy {
             OrderSide::Buy
         } else {
@@ -925,6 +993,9 @@ impl UpgradeableTradingContract {
 
         let timestamp = env.ledger().timestamp();
         let order_id = next_order_id(&env);
+
+        // Generate risk metadata
+        let risk_metadata = RiskManager::generate_risk_metadata(&env, &trader, pool_liquidity, amount, price);
 
         let mut order = LimitOrder {
             id: order_id,
@@ -937,6 +1008,7 @@ impl UpgradeableTradingContract {
             status: OrderStatus::Open,
             tif: tif.clone(),
             timestamp,
+            risk_metadata,
         };
 
         if tif == TimeInForce::Fok {
@@ -952,7 +1024,7 @@ impl UpgradeableTradingContract {
             (symbol_short!("ord_cr"),),
             OrderCreated {
                 order_id,
-                owner: trader,
+                owner: trader.clone(),
                 pair,
                 is_buy,
                 price,
@@ -964,6 +1036,14 @@ impl UpgradeableTradingContract {
 
         match_limit_order(&env, &mut order)?;
         write_order(&env, &order);
+
+        // Update position and consume volume for filled amount
+        let filled_amount = amount - order.remaining;
+        if filled_amount > 0 {
+            RiskManager::consume_daily_volume(&env, &trader, filled_amount);
+            let position_delta = if is_buy { filled_amount } else { -filled_amount };
+            RiskManager::update_position_size(&env, &trader, position_delta);
+        }
 
         match order.tif {
             TimeInForce::Gtc => {
@@ -1242,6 +1322,64 @@ impl UpgradeableTradingContract {
     /// Get current circuit breaker config
     pub fn get_cb_config(env: Env) -> CircuitBreakerConfig {
         CircuitBreaker::get_config(&env)
+    }
+
+    /// Update user KYC level (ACL protected)
+    pub fn update_user_kyc(
+        env: Env,
+        admin: Address,
+        user: Address,
+        kyc_level: Symbol,
+    ) -> Result<RiskTier, TradeError> {
+        admin.require_auth();
+        require_initialized(&env)?;
+        ACL::require_permission(&env, &admin, &PERMISSION_PREMIUM);
+
+        let new_tier = RiskManager::update_kyc_level(&env, &user, kyc_level);
+        Ok(new_tier)
+    }
+
+    /// Get user risk profile
+    pub fn get_user_risk_profile(env: Env, user: Address) -> risk_management::UserRiskProfile {
+        require_initialized(&env).ok();
+        RiskManager::get_user_profile(&env, &user)
+    }
+
+    /// Get tier configuration
+    pub fn get_tier_config(env: Env, tier: RiskTier) -> risk_management::RiskTierConfig {
+        require_initialized(&env).ok();
+        RiskManager::get_tier_config(&env, tier)
+    }
+
+    /// Update tier configuration (ACL protected)
+    pub fn update_tier_config(
+        env: Env,
+        admin: Address,
+        tier: RiskTier,
+        config: risk_management::RiskTierConfig,
+    ) -> Result<(), TradeError> {
+        admin.require_auth();
+        require_initialized(&env)?;
+        ACL::require_permission(&env, &admin, &PERMISSION_SET_RATE);
+
+        RiskManager::update_tier_config(&env, tier, config);
+        Ok(())
+    }
+
+    /// Get tiered circuit breaker state
+    pub fn get_tiered_cb_state(env: Env) -> TieredCircuitBreakerState {
+        require_initialized(&env).ok();
+        RiskManager::get_circuit_breaker_state(&env)
+    }
+
+    /// Reset tiered circuit breaker (ACL protected)
+    pub fn reset_tiered_circuit_breaker(env: Env, admin: Address) -> Result<(), TradeError> {
+        admin.require_auth();
+        require_initialized(&env)?;
+        ACL::require_permission(&env, &admin, &PERMISSION_PAUSE);
+
+        RiskManager::reset_circuit_breaker(&env);
+        Ok(())
     }
 
     /// Pause the contract (ACL protected)
