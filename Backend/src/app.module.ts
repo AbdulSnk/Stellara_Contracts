@@ -1,6 +1,6 @@
 import { Module, MiddlewareConsumer, NestModule } from '@nestjs/common';
 import { TypeOrmModule } from '@nestjs/typeorm';
-import { ConfigModule, ConfigService } from '@nestjs/config';
+import { ConfigModule as NestConfigModule, ConfigService } from '@nestjs/config';
 import { ScheduleModule } from '@nestjs/schedule';
 import { APP_GUARD, APP_INTERCEPTOR } from '@nestjs/core';
 
@@ -21,8 +21,7 @@ import { AiModule } from './ai/ai.module';
 import { RolesGuard } from './guards/roles.guard';
 import { ConfigValidationService } from './config/config-validation.service';
 import { StartupValidationService } from './config/startup-validation.service';
-import { SecretsMaskingService } from './config/secrets-masking.service';
-import { SecretsRotationService } from './config/secrets-rotation.service';
+import { ConfigModule } from './config/config.module';
 
 import { Workflow } from './workflow/entities/workflow.entity';
 import { WorkflowStep } from './workflow/entities/workflow-step.entity';
@@ -42,14 +41,14 @@ import { CorrelationMiddleware } from './observability/middleware/correlation.mi
 
 @Module({
   imports: [
-    ConfigModule.forRoot({
+    NestConfigModule.forRoot({
       isGlobal: true,
     }),
 
     ScheduleModule.forRoot(),
 
 TypeOrmModule.forRootAsync({
-      imports: [ConfigModule],
+      imports: [NestConfigModule],
       inject: [ConfigService],
       useFactory: (configService: ConfigService) => ({
         type: 'postgres',
@@ -95,6 +94,7 @@ VoiceJob,
     AiModule,
     HealthModule,
     ObservabilityModule,
+    ConfigModule,
   ],
 
   controllers: [AppController],
@@ -103,8 +103,6 @@ VoiceJob,
     AppService,
     ConfigValidationService,
     StartupValidationService,
-    SecretsMaskingService,
-    SecretsRotationService,
 
     /**
      * Global RBAC enforcement
