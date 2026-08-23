@@ -1,4 +1,4 @@
-use soroban_sdk::{contracttype, symbol_short, Address, Env, Symbol, Map};
+use soroban_sdk::{symbol_short, Address, Env, Symbol, Map, contracttype};
 
 /// Risk tier classification based on KYC status and account age
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
@@ -14,7 +14,20 @@ pub enum RiskTier {
     Institutional = 3,
 }
 
+impl From<u32> for RiskTier {
+    fn from(value: u32) -> Self {
+        match value {
+            0 => RiskTier::Basic,
+            1 => RiskTier::Verified,
+            2 => RiskTier::Enhanced,
+            3 => RiskTier::Institutional,
+            _ => RiskTier::Basic,
+        }
+    }
+}
+
 /// Risk tier configuration for a specific tier
+#[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RiskTierConfig {
     /// Maximum position size (in base token units)
@@ -30,7 +43,6 @@ pub struct RiskTierConfig {
 }
 
 /// User risk profile
-#[contracttype]
 #[derive(Clone, Debug)]
 pub struct UserRiskProfile {
     pub user: Address,
@@ -43,10 +55,9 @@ pub struct UserRiskProfile {
 }
 
 /// Risk metadata for compliance auditing
-#[contracttype]
 #[derive(Clone, Debug)]
 pub struct RiskMetadata {
-    pub user_tier: RiskTier,
+    pub user_tier: u32,
     pub position_limit: i128,
     pub volume_cap: i128,
     pub slippage_limit_bps: u32,
@@ -55,7 +66,6 @@ pub struct RiskMetadata {
 }
 
 /// Liquidity check result
-#[contracttype]
 #[derive(Clone, Debug)]
 pub struct LiquidityCheck {
     pub pool_liquidity: i128,
@@ -66,6 +76,7 @@ pub struct LiquidityCheck {
 }
 
 /// Circuit breaker configuration with tier-specific thresholds
+#[contracttype]
 #[derive(Clone, Debug)]
 pub struct TieredCircuitBreakerConfig {
     /// Price volatility threshold per tier (in basis points)
@@ -77,6 +88,7 @@ pub struct TieredCircuitBreakerConfig {
 }
 
 /// Circuit breaker state with tier-specific tracking
+#[contracttype]
 #[derive(Clone, Debug)]
 pub struct TieredCircuitBreakerState {
     pub last_price: i128,
@@ -147,10 +159,11 @@ impl RiskManager {
 
     /// Initialize risk manager with tier configurations
     pub fn init(env: &Env) {
-        let mut tier_configs: Map<RiskTier, RiskTierConfig> = Map::new(env);
+        let mut tier_configs: Map<u32, (i128, i128, u32, i128, i128)> = Map::new(env);
         
         for tier in [RiskTier::Basic, RiskTier::Verified, RiskTier::Enhanced, RiskTier::Institutional] {
-            tier_configs.set(tier, RiskTier::default_config(env, tier));
+            let config = RiskTier::default_config(env, tier);
+            tier_configs.set(tier as u32, (config.max_position_size, config.daily_volume_cap, config.max_slippage_bps, config.min_liquidity_threshold, config.max_trade_size));
         }
         
         env.storage().persistent().set(&Self::TIER_CONFIG_KEY, &tier_configs);
@@ -168,30 +181,25 @@ impl RiskManager {
         volume_multipliers.set(2, 500); // 5x for Enhanced
         volume_multipliers.set(3, 1000); // 10x for Institutional
 
-        let cb_config = TieredCircuitBreakerConfig {
-            volatility_thresholds,
-            volume_surge_multipliers: volume_multipliers,
-            observation_window_secs: 300, // 5 minutes
-        };
+        env.storage().persistent().set(&Self::CB_CONFIG_KEY, &(volatility_thresholds, volume_multipliers, 300u64));
 
-        env.storage().persistent().set(&Self::CB_CONFIG_KEY, &cb_config);
-
-        let cb_state = TieredCircuitBreakerState {
-            last_price: 0,
-            last_price_timestamp: 0,
-            triggered_tier: None,
-            trigger_reason: symbol_short!("none"),
-            triggered_at: 0,
-        };
-
+        let cb_state: (i128, u64, Option<u32>, Symbol, u64) = (0, 0, None, symbol_short!("none"), 0);
         env.storage().persistent().set(&Self::CB_STATE_KEY, &cb_state);
     }
 
     /// Get or create user risk profile
     pub fn get_user_profile(env: &Env, user: &Address) -> UserRiskProfile {
         let key = (Self::USER_RISK_KEY, user.clone());
-        if let Some(profile) = env.storage().persistent().get(&key) {
-            profile
+        if let Some((stored_user, tier, account_created_at, kyc_level, daily_volume_used, daily_volume_window_start, current_position_size)) = env.storage().persistent().get::<_, (Address, u32, u64, Symbol, i128, u64, i128)>(&key) {
+            UserRiskProfile {
+                user: stored_user,
+                tier: RiskTier::from(tier),
+                account_created_at,
+                kyc_level,
+                daily_volume_used,
+                daily_volume_window_start,
+                current_position_size,
+            }
         } else {
             // Create default profile for new user
             let now = env.ledger().timestamp();
@@ -210,7 +218,7 @@ impl RiskManager {
     /// Update user risk profile
     pub fn update_user_profile(env: &Env, user: &Address, profile: UserRiskProfile) {
         let key = (Self::USER_RISK_KEY, user.clone());
-        env.storage().persistent().set(&key, &profile);
+        env.storage().persistent().set(&key, &(profile.user, profile.tier as u32, profile.account_created_at, profile.kyc_level, profile.daily_volume_used, profile.daily_volume_window_start, profile.current_position_size));
     }
 
     /// Update user KYC level and recalculate tier
@@ -230,13 +238,20 @@ impl RiskManager {
 
     /// Get tier configuration
     pub fn get_tier_config(env: &Env, tier: RiskTier) -> RiskTierConfig {
-        let tier_configs: Map<RiskTier, RiskTierConfig> = env
+        let tier_configs: Map<u32, (i128, i128, u32, i128, i128)> = env
             .storage()
             .persistent()
             .get(&Self::TIER_CONFIG_KEY)
             .expect("Risk manager not initialized");
         
-        tier_configs.get(tier).expect("Tier config not found")
+        let (max_position_size, daily_volume_cap, max_slippage_bps, min_liquidity_threshold, max_trade_size) = tier_configs.get(tier as u32).expect("Tier config not found");
+        RiskTierConfig {
+            max_position_size,
+            daily_volume_cap,
+            max_slippage_bps,
+            min_liquidity_threshold,
+            max_trade_size,
+        }
     }
 
     /// Check if trade respects position limits
@@ -305,53 +320,53 @@ impl RiskManager {
     /// Check circuit breaker based on price volatility
     pub fn check_circuit_breaker(env: &Env, user: &Address, current_price: i128) -> bool {
         let profile = Self::get_user_profile(env, user);
-        let cb_config: TieredCircuitBreakerConfig = env
+        let (volatility_thresholds, _volume_surge_multipliers, observation_window_secs): (Map<u32, u32>, Map<u32, u32>, u64) = env
             .storage()
             .persistent()
             .get(&Self::CB_CONFIG_KEY)
             .expect("Circuit breaker not initialized");
         
-        let mut cb_state: TieredCircuitBreakerState = env
+        let (mut last_price, mut last_price_timestamp, mut triggered_tier, mut trigger_reason, mut triggered_at): (i128, u64, Option<u32>, Symbol, u64) = env
             .storage()
             .persistent()
             .get(&Self::CB_STATE_KEY)
             .expect("Circuit breaker state not found");
         
         // If already triggered, check if cooldown period passed
-        if cb_state.triggered_tier.is_some() {
+        if triggered_tier.is_some() {
             let now = env.ledger().timestamp();
             let cooldown_secs = 3600; // 1 hour cooldown
-            if now < cb_state.triggered_at + cooldown_secs {
+            if now < triggered_at + cooldown_secs {
                 return false;
             }
             // Reset after cooldown
-            cb_state.triggered_tier = None;
-            cb_state.trigger_reason = symbol_short!("none");
+            triggered_tier = None;
+            trigger_reason = symbol_short!("none");
         }
         
         // Check price volatility
         let now = env.ledger().timestamp();
-        if cb_state.last_price > 0 && now < cb_state.last_price_timestamp + cb_config.observation_window_secs {
-            let threshold_bps = cb_config.volatility_thresholds
+        if last_price > 0 && now < last_price_timestamp + observation_window_secs {
+            let threshold_bps = volatility_thresholds
                 .get(profile.tier as u32)
                 .unwrap_or(100);
             
-            let price_change = ((current_price - cb_state.last_price) * 10000) / cb_state.last_price;
+            let price_change = ((current_price - last_price) * 10000) / last_price;
             let price_change_abs = if price_change < 0 { -price_change } else { price_change };
             
             if price_change_abs > threshold_bps as i128 {
-                cb_state.triggered_tier = Some(profile.tier as u32);
-                cb_state.trigger_reason = symbol_short!("vol");
-                cb_state.triggered_at = now;
-                env.storage().persistent().set(&Self::CB_STATE_KEY, &cb_state);
+                triggered_tier = Some(profile.tier as u32);
+                trigger_reason = symbol_short!("vol");
+                triggered_at = now;
+                env.storage().persistent().set(&Self::CB_STATE_KEY, &(last_price, last_price_timestamp, triggered_tier, trigger_reason, triggered_at));
                 return false;
             }
         }
         
         // Update last price
-        cb_state.last_price = current_price;
-        cb_state.last_price_timestamp = now;
-        env.storage().persistent().set(&Self::CB_STATE_KEY, &cb_state);
+        last_price = current_price;
+        last_price_timestamp = now;
+        env.storage().persistent().set(&Self::CB_STATE_KEY, &(last_price, last_price_timestamp, triggered_tier, trigger_reason, triggered_at));
         
         true
     }
@@ -371,7 +386,7 @@ impl RiskManager {
         let cb_check = Self::check_circuit_breaker(env, user, current_price);
         
         RiskMetadata {
-            user_tier: profile.tier,
+            user_tier: profile.tier as u32,
             position_limit: config.max_position_size,
             volume_cap: config.daily_volume_cap,
             slippage_limit_bps: config.max_slippage_bps,
@@ -382,33 +397,35 @@ impl RiskManager {
 
     /// Get circuit breaker state
     pub fn get_circuit_breaker_state(env: &Env) -> TieredCircuitBreakerState {
-        env.storage()
+        let (last_price, last_price_timestamp, triggered_tier, trigger_reason, triggered_at) = env
+            .storage()
             .persistent()
             .get(&Self::CB_STATE_KEY)
-            .expect("Circuit breaker state not found")
+            .expect("Circuit breaker state not found");
+        TieredCircuitBreakerState {
+            last_price,
+            last_price_timestamp,
+            triggered_tier,
+            trigger_reason,
+            triggered_at,
+        }
     }
 
     /// Reset circuit breaker (admin only)
     pub fn reset_circuit_breaker(env: &Env) {
-        let cb_state = TieredCircuitBreakerState {
-            last_price: 0,
-            last_price_timestamp: 0,
-            triggered_tier: None,
-            trigger_reason: symbol_short!("none"),
-            triggered_at: 0,
-        };
+        let cb_state: (i128, u64, Option<u32>, Symbol, u64) = (0, 0, None, symbol_short!("none"), 0);
         env.storage().persistent().set(&Self::CB_STATE_KEY, &cb_state);
     }
 
     /// Update tier configuration (admin only)
     pub fn update_tier_config(env: &Env, tier: RiskTier, config: RiskTierConfig) {
-        let mut tier_configs: Map<RiskTier, RiskTierConfig> = env
+        let mut tier_configs: Map<u32, (i128, i128, u32, i128, i128)> = env
             .storage()
             .persistent()
             .get(&Self::TIER_CONFIG_KEY)
             .expect("Risk manager not initialized");
         
-        tier_configs.set(tier, config);
+        tier_configs.set(tier as u32, (config.max_position_size, config.daily_volume_cap, config.max_slippage_bps, config.min_liquidity_threshold, config.max_trade_size));
         env.storage().persistent().set(&Self::TIER_CONFIG_KEY, &tier_configs);
     }
 }
