@@ -2,11 +2,7 @@ import { validateSync } from 'class-validator';
 import { plainToInstance } from 'class-transformer';
 import { ConfigDto } from './config.dto';
 
-/**
- * Validate environment values before Nest creates any dependency clients.
- * This function deliberately has no Nest or application-service dependencies
- * so it can be used by ConfigModule.forRoot's pre-bootstrap validate hook.
- */
+/** Validate configuration before Nest creates dependency clients. */
 export function validateEnvironment(
   values: Record<string, unknown>,
 ): Record<string, unknown> {

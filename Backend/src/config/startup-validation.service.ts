@@ -44,8 +44,8 @@ export class StartupValidationService {
    * Run all startup dependency checks.
    * Returns a report with per-dependency status and an overall pass/fail.
    *
-   * @param options.timeoutMs  Per-check timeout in milliseconds.
-    * @param options.failOnError If true, throws when any required dependency check fails.
+  * @param options.timeoutMs Per-check timeout in milliseconds.
+  * @param options.failOnError Throw when a required dependency check fails.
    */
   async validate(options?: {
     timeoutMs?: number;

@@ -41,7 +41,7 @@ async function bootstrap() {
   const bootstrapStart = Date.now();
   const logger = new Logger('Bootstrap');
 
-  // ConfigModule validates the complete environment before this container is created.
+  // ConfigModule validates environment before dependencies are created.
   logger.log('Phase 1/3: Creating application container…');
   const containerStart = Date.now();
 
@@ -55,8 +55,7 @@ async function bootstrap() {
 
   logger.log(`Phase 1/3: ✅ Container ready (${Date.now() - containerStart}ms)`);
 
-  // ── Phase 2: Configuration validation ────────────────────────────────────
-  // Validates all env vars against the ConfigDto schema (type, range, format).
+  // Validate the resolved configuration before opening the server.
   logger.log('Phase 2/3: Running configuration schema validation…');
   const configStart = Date.now();
 
@@ -83,8 +82,7 @@ async function bootstrap() {
     process.exit(1);
   }
 
-  // ── Phase 3: Dependency connectivity checks ──────────────────────────────
-  // Validates DB, Redis, and Queue configuration at startup with timeouts.
+  // Check required dependencies before accepting requests.
   logger.log('Phase 3/3: Validating dependency connectivity…');
   const depStart = Date.now();
 
