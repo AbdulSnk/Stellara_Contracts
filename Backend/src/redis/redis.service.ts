@@ -42,7 +42,11 @@ export class RedisService implements OnModuleInit, OnModuleDestroy {
    * in application logs.
    */
   private async connect(): Promise<void> {
-    const url = process.env.REDIS_URL || 'redis://localhost:6379';
+    const url = process.env.REDIS_URL || (() => {
+      const password = process.env.REDIS_PASSWORD;
+      const auth = password ? `:${encodeURIComponent(password)}@` : '';
+      return `redis://${auth}${process.env.REDIS_HOST || 'localhost'}:${process.env.REDIS_PORT || 6379}`;
+    })();
     const safeUrl = this.maskingService.mask(url);
 
     this.logger.log(`Connecting to Redis: ${safeUrl}`);

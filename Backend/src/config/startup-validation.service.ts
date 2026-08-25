@@ -45,8 +45,7 @@ export class StartupValidationService {
    * Returns a report with per-dependency status and an overall pass/fail.
    *
    * @param options.timeoutMs  Per-check timeout in milliseconds.
-   * @param options.failOnError If true, throws on any critical failure (database).
-   *                            Redis failures produce a warning but don't block startup.
+    * @param options.failOnError If true, throws when any required dependency check fails.
    */
   async validate(options?: {
     timeoutMs?: number;
@@ -104,25 +103,13 @@ export class StartupValidationService {
     // Log summary
     this.logStartupReport(report);
 
-    // Fail-fast for critical dependencies
-    const criticalFailures = checks.filter(
-      (c) => c.status === 'error' && c.name === 'database',
-    );
+    // Database, Redis, and queue configuration are all required to start.
+    const criticalFailures = checks.filter((c) => c.status === 'error');
 
     if (failOnError && criticalFailures.length > 0) {
       const messages = criticalFailures.map((c) => `${c.name}: ${c.message}`).join('; ');
       throw new Error(
         `Startup validation failed — critical dependency unavailable: ${messages}`,
-      );
-    }
-
-    // Redis failures are warnings, not fatal (app can run in degraded mode)
-    const redisFailures = checks.filter(
-      (c) => c.status === 'error' && c.name === 'redis',
-    );
-    if (redisFailures.length > 0) {
-      this.logger.warn(
-        'Redis unavailable — application will run in degraded mode (no real-time events, no queue processing)',
       );
     }
 

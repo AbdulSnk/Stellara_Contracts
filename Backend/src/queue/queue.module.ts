@@ -18,9 +18,10 @@ import type { Queue } from 'bull';
     BullModule.forRootAsync({
       imports: [ConfigModule],
       useFactory: (configService: ConfigService) => ({
-        redis: {
+        redis: configService.get<string>('REDIS_URL') || {
           host: configService.get('REDIS_HOST') || 'localhost',
           port: configService.get('REDIS_PORT') || 6379,
+          password: configService.get('REDIS_PASSWORD'),
           db: configService.get('REDIS_QUEUE_DB') || 1,
         },
         defaultJobOptions: {
